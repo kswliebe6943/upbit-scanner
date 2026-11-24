@@ -445,6 +445,14 @@ def format_price_columns(df: pd.DataFrame, price_cols: list, int_cols: list = No
     return out
 
 
+def reorder_columns_front(df: pd.DataFrame, priority_cols: list) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    front = [c for c in priority_cols if c in df.columns]
+    rest = [c for c in df.columns if c not in front]
+    return df[front + rest]
+
+
 def build_scalp_plan(
     cur_price: float,
     open_price: float,
@@ -457,7 +465,6 @@ def build_scalp_plan(
     span = max(high_price - low_price, 0.0)
     upper_wick_ratio = ((high_price - max(cur_price, open_price)) / span) if span > 0 else 0.0
 
-    # 30분 단타 체결률과 눌림 품질의 균형을 맞춘 매수가/타이밍 산출
     if vol_mult >= 5.0 and ret_pct >= 4.5:
         buy_raw = cur_price * 0.9965
         timing = "과열 진정 후 눌림 (10~25분 내 -0.35% 부근 분할)"
@@ -715,12 +722,10 @@ def _evaluate_single_spike(
     best_ret_pct = max(ret_vs_prev_pct, ret_candle_pct)
     trade_val_krw = float(latest.get("candle_acc_trade_price", cur_price * cur_vol))
 
-    # 직전 3봉 누적 상승률(이미 연속 급등한 과열 구간 제외용)
     base_3_idx = min(3, len(raw) - 1)
     base_3_price = float(raw[base_3_idx]["trade_price"])
     cum_3_ret_pct = ((cur_price - base_3_price) / base_3_price) * 100.0 if base_3_price > 0 else 0.0
 
-    # 윗꼬리 비율(고점 매물/휩소 회피용)
     candle_span = max(high_price - low_price, 0.0)
     upper_wick_ratio = ((high_price - max(cur_price, open_price)) / candle_span) if candle_span > 0 else 0.0
 
@@ -752,10 +757,10 @@ def _evaluate_single_spike(
         "코인": format_coin_label(m),
         "추천매수금액": rec_buy,
         "추천매도금액": rec_sell,
+        "거래량배율(배)": vol_fmt,
+        "상승률(%)": ret_fmt,
         "추천매수타이밍": timing,
         "포착시점현재가": cur_fmt,
-        "상승률(%)": ret_fmt,
-        "거래량배율(배)": vol_fmt,
         "거래대금(만원)": val_man,
         "봉": timeframe,
     }
@@ -879,7 +884,6 @@ def _verify_single_scalp(
     end_dt = det_dt + timedelta(minutes=window_minutes)
     elapsed_minutes = (now_dt - det_dt).total_seconds() / 60.0
 
-    # 경과 시간에 맞춰 필요한 분봉 수만 조회해 API 호출 부하 절감
     needed_1m = int(min(120, max(10, elapsed_minutes + 5)))
     raw_1m = _fast_fetch_candles(market, timeframe="1m", count=needed_1m)
     time.sleep(0.03)
@@ -1142,10 +1146,14 @@ def load_scalp_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.Data
         "verified_at": "검증시각",
     })
     renamed = attach_korean_coin_names(renamed, col_name="코인")
-    return format_price_columns(
+    formatted = format_price_columns(
         renamed,
         price_cols=["포착시점현재가", "추천매수금액", "추천매도금액"],
         int_cols=["번호"],
+    )
+    return reorder_columns_front(
+        formatted,
+        ["포착시각", "코인", "추천매수금액", "추천매도금액", "거래량배율(배)", "상승률(%)", "매수여부", "결과", "추천매수타이밍"],
     )
 
 
@@ -1159,10 +1167,10 @@ def _make_ui_progress_cb(bar, caption_box):
 
 
 # =====================================================================
-# 화면 구성
+# 화면 구성 (폰 단타 중심 레이아웃)
 # =====================================================================
-st.title("📈 업비트 AI 코인 예측 스캐너")
-st.caption("스테이블코인 제외 · 1d/240m/60m AI 모델 + 최적화 단타 포착 (KST 기준)")
+st.title("⚡ 업비트 단타 & AI 스캐너")
+st.caption(f"KST 기준 ({now_kst_str('%H:%M:%S')}) · 단타 초입 수급 포착 + LightGBM AI 스캐너")
 
 if "reset_nonce" not in st.session_state:
     st.session_state["reset_nonce"] = 0
@@ -1175,9 +1183,9 @@ if "scalp_result_df" not in st.session_state:
 
 with st.sidebar:
     st.header("⚙️ 제어 패널")
-    top_n = st.slider("표시할 상위 코인 수", min_value=3, max_value=30, value=10, step=1)
-    min_prob_3 = st.slider("최소 +3% 상승 확률 필터 (%)", min_value=30, max_value=85, value=55, step=5) / 100.0
-    success_target = st.selectbox("AI 성공 판정 기준 목표", options=[3, 5, 10, 20], index=0)
+    top_n = st.slider("AI 표시 상위 코인 수", min_value=3, max_value=30, value=10, step=1)
+    min_prob_3 = st.slider("AI 최소 +3% 확률 필터 (%)", min_value=30, max_value=85, value=55, step=5) / 100.0
+    success_target = st.selectbox("AI 성공 판정 목표", options=[3, 5, 10, 20], index=0)
 
     if st.button("🔄 화면 새로고침", use_container_width=True):
         st.rerun()
@@ -1209,7 +1217,7 @@ with st.sidebar:
             st.error(f"❌ 학습 오류: {type(exc).__name__}: {exc}")
 
     st.divider()
-    if st.button("🔍 지금 전 종목 스캔", type="primary", use_container_width=True):
+    if st.button("🔍 지금 전 종목 AI 스캔", type="primary", use_container_width=True):
         p_bar = st.progress(0.05)
         p_cap = st.empty()
         cb = _make_ui_progress_cb(p_bar, p_cap)
@@ -1261,58 +1269,24 @@ with st.sidebar:
         st.session_state["last_reset_msg"] = f"{' · '.join(cleared)} 초기화 완료!"
         st.rerun()
 
-# 1. DB 수집 현황
-st.subheader("1. DB 수집 현황 (1d / 240m / 60m)")
-stats_df = load_db_stats()
-if stats_df.empty:
-    st.warning("아직 DB에 수집된 캔들 데이터가 없습니다. 왼쪽 **'최신 캔들 데이터 수집'** 버튼을 눌러주세요.")
-else:
-    cols = st.columns(len(stats_df))
-    label_map = {"1d": "일봉 (1d)", "240m": "4시간봉 (240m)", "60m": "60분봉 (60m)"}
-    for idx, (_, r) in enumerate(stats_df.iterrows()):
-        with cols[idx]:
-            tf_label = label_map.get(r["timeframe"], r["timeframe"])
-            st.metric(
-                label=tf_label,
-                value=f"{int(r['candle_count']):,}개",
-                delta=f"{int(r['coin_count']):,}개 코인",
-            )
-            st.caption(f"기간: {str(r['earliest_kst'])[:10]} ~ {str(r['latest_kst'])[:10]}")
+# =====================================================================
+# 1. [상단 메인] 실시간 단타 포착
+# =====================================================================
+st.subheader("1. 실시간 단타 포착 (초입 수급 · 추천 매수/매도가)")
 
-st.divider()
+r1_c1, r1_c2, r1_c3 = st.columns(3)
+spike_tf = r1_c1.selectbox("감지 봉", options=["5m", "15m"], index=0)
+min_vol_mult = r1_c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, value=4.0, step=0.5)
+min_ret_pct = r1_c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, value=1.5, step=0.5)
 
-# 2. AI 스캔 결과
-st.subheader("2. AI 상승 확률 · 추천 매수/매도가 · 예상 매수 시점")
-if not models_ready():
-    st.info("아직 학습된 모델 파일(`models/lgb_target_*.txt`)이 없습니다. 데이터가 모인 뒤 왼쪽 **'AI 모델 학습/재학습'**을 눌러주세요.")
-
-scan_df = st.session_state.get("scan_result_df")
-if isinstance(scan_df, pd.DataFrame) and not scan_df.empty:
-    formatted_scan = attach_korean_coin_names(scan_df, col_name="코인")
-    formatted_scan = format_price_columns(
-        formatted_scan,
-        price_cols=["현재가", "추천매수가", "손절가", "목표+3%", "목표+5%", "목표+10%", "목표+20%"],
-    )
-    st.dataframe(formatted_scan, use_container_width=True, hide_index=True)
-elif isinstance(scan_df, pd.DataFrame) and scan_df.empty:
-    st.info("현재 필터 조건을 충족하는 코인이 없습니다. 확률 기준을 낮춰 다시 스캔해 보세요.")
-
-st.divider()
-
-# 3. 실시간 단타 포착 & 30분 단타 성공/실패 통계
-st.subheader("3. 실시간 단타 포착 (거래대금 상위 30순 · 추천 매수·매도가 & 타이밍)")
-
-c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
-spike_tf = c1.selectbox("감지 봉", options=["5m", "15m"], index=0)
-min_vol_mult = c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, value=4.0, step=0.5)
-min_ret_pct = c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, value=1.5, step=0.5)
-target_pct = c4.slider("단타 목표수익 (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
-stop_loss_pct = c5.slider("단타 손절 기준 (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
-max_coins = c6.slider("거래대금 상위 탐색 수", min_value=10, max_value=296, value=30, step=10)
+r2_c1, r2_c2, r2_c3 = st.columns(3)
+target_pct = r2_c1.slider("목표수익 (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+stop_loss_pct = r2_c2.slider("손절 기준 (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
+max_coins = r2_c3.slider("상위 탐색 수", min_value=10, max_value=296, value=50, step=10)
 
 b_col1, b_col2 = st.columns([2, 1])
 with b_col1:
-    if st.button("⚡ 지금 단타 종목 포착하기", use_container_width=True):
+    if st.button("⚡ 지금 단타 종목 포착하기", type="primary", use_container_width=True):
         s_bar = st.progress(0.05)
         s_cap = st.empty()
         s_cb = _make_ui_progress_cb(s_bar, s_cap)
@@ -1335,7 +1309,7 @@ with b_col1:
             st.error(f"❌ 단타 포착 오류: {type(exc).__name__}: {exc}")
 
 with b_col2:
-    if st.button("✅ 단타 성공/실패 검증 (30분)", use_container_width=True):
+    if st.button("✅ 단타 검증 (30분)", use_container_width=True):
         v_bar = st.progress(0.05)
         v_cap = st.empty()
         v_cb = _make_ui_progress_cb(v_bar, v_cap)
@@ -1355,25 +1329,33 @@ if isinstance(spike_df, pd.DataFrame) and not spike_df.empty:
         price_cols=["추천매수금액", "추천매도금액", "포착시점현재가"],
         int_cols=["거래대금(만원)"],
     )
+    formatted_spike = reorder_columns_front(
+        formatted_spike,
+        ["코인", "추천매수금액", "추천매도금액", "거래량배율(배)", "상승률(%)", "추천매수타이밍", "포착시점현재가"],
+    )
     st.dataframe(formatted_spike, use_container_width=True, hide_index=True)
 elif isinstance(spike_df, pd.DataFrame) and spike_df.empty:
-    st.info("현재 조건에 맞는 단타 종목이 없습니다. 거래량 배율이나 최소 상승률을 조금 낮춰 다시 눌러보세요.")
+    st.info("현재 조건에 맞는 단타 종목이 없습니다. 거래량 배율이나 최소 상승률을 낮추거나 탐색 수를 늘려보세요.")
 
-st.markdown("#### 실시간 단타 포착 성공/실패 통계 (30분·손절 기준)")
+st.divider()
+
+# =====================================================================
+# 2. 단타 성공/실패 통계 및 포착 로그
+# =====================================================================
+st.subheader("2. 단타 포착 통계 & 로그 (30분·손절 기준)")
 scalp_stat = get_scalp_statistics()
 if scalp_stat["total"] == 0:
-    st.caption("아직 저장된 단타 포착 로그가 없습니다. **'지금 단타 종목 포착하기'**를 누르면 자동으로 기록됩니다.")
+    st.caption("아직 저장된 단타 포착 로그가 없습니다. **'지금 단타 종목 포착하기'**를 누르면 기록됩니다.")
 else:
-    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1, s2, s3 = st.columns(3)
     s1.metric("누적 단타 포착", f"{scalp_stat['total']:,}건")
     s2.metric("판정 완료", f"{scalp_stat['settled']:,}건")
-    s3.metric("성공", f"{scalp_stat['success']:,}건")
-    s4.metric("실패", f"{scalp_stat['fail']:,}건")
-    s5.metric("단타 실제 성공률", f"{scalp_stat['win_rate']}%")
-    s6.metric("판정건 평균 최고수익", f"{scalp_stat['avg_max_gain']}%")
+    s3.metric("단타 실제 성공률", f"{scalp_stat['win_rate']}%")
 
-    if not scalp_stat["by_vol"].empty:
-        st.dataframe(scalp_stat["by_vol"], use_container_width=True, hide_index=True)
+    s4, s5, s6 = st.columns(3)
+    s4.metric("성공", f"{scalp_stat['success']:,}건")
+    s5.metric("실패", f"{scalp_stat['fail']:,}건")
+    s6.metric("판정건 평균 최고수익", f"{scalp_stat['avg_max_gain']}%")
 
     scalp_filter = st.radio(
         "단타 로그 필터",
@@ -1384,41 +1366,72 @@ else:
     scalp_logs_df = load_scalp_logs(limit=200, outcome_filter=scalp_filter)
     st.dataframe(scalp_logs_df, use_container_width=True, hide_index=True)
 
+    with st.expander("거래량 배율 구간별 단타 성공률 보기"):
+        if not scalp_stat["by_vol"].empty:
+            st.dataframe(scalp_stat["by_vol"], use_container_width=True, hide_index=True)
+
 st.divider()
 
-# 4. 누적 AI 추천 리스트 & 성공/실패 확률 통계 (성공·실패 사유 포함)
-st.subheader("4. 누적 AI 추천 코인 리스트 & 성공/실패 통계")
-st.caption("AI 추천 검증은 **'AI 성공여부 검증'** 버튼을 누를 때 예측 시각 이후 실제 캔들을 기준으로 판정됩니다.")
-stat_bundle = get_prediction_statistics()
+# =====================================================================
+# 3. AI 스캔 결과 & 누적 AI 추천 통계
+# =====================================================================
+st.subheader("3. AI 상승 확률 스캔 & 누적 추천 통계")
+if not models_ready():
+    st.info("아직 학습된 모델 파일(`models/lgb_target_*.txt`)이 없습니다. 왼쪽 메뉴에서 학습을 진행해 주세요.")
 
-if stat_bundle["total"] == 0:
-    st.info("아직 저장된 AI 추천 코인 리스트가 없습니다. 스캔을 실행하면 자동으로 리스트가 쌓입니다.")
-else:
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("누적 추천 건수", f"{stat_bundle['total']:,}건")
-    k2.metric("판정 완료 건수", f"{stat_bundle['settled']:,}건")
-    k3.metric("성공", f"{stat_bundle['success']:,}건")
-    k4.metric("실패", f"{stat_bundle['fail']:,}건")
-    k5.metric("실제 성공률", f"{stat_bundle['win_rate']}%")
-
-    st.markdown("#### AI 추천 성공 / 실패 상세 사유 요약")
-    reason_df = get_ai_reason_summary()
-    if not reason_df.empty:
-        st.dataframe(reason_df, use_container_width=True, hide_index=True)
-    else:
-        st.caption("아직 판정 완료된 AI 추천 건이 없습니다. 검증 버튼을 눌러 판정을 진행해 보세요.")
-
-    st.markdown("#### 목표(+3% / +5% / +10% / +20%)별 실제 달성 확률 vs AI 예측 확률")
-    target_stats_df = stat_bundle["target_stats"]
-    if not target_stats_df.empty:
-        st.dataframe(target_stats_df, use_container_width=True, hide_index=True)
-
-    st.markdown("#### 저장된 AI 추천 코인 전체 리스트 & 판정 결과")
-    filter_choice = st.radio(
-        "결과 필터",
-        options=["전체", "성공", "실패", "대기중"],
-        horizontal=True,
-        key="ai_filter_radio",
+scan_df = st.session_state.get("scan_result_df")
+if isinstance(scan_df, pd.DataFrame) and not scan_df.empty:
+    formatted_scan = attach_korean_coin_names(scan_df, col_name="코인")
+    formatted_scan = format_price_columns(
+        formatted_scan,
+        price_cols=["현재가", "추천매수가", "손절가", "목표+3%", "목표+5%", "목표+10%", "목표+20%"],
     )
-    logs_df = load_prediction_logs(limit=200, outcome_filter=filter_choice)
-    st.dataframe(logs_df, use_container_width=True, hide_index=True)
+    st.dataframe(formatted_scan, use_container_width=True, hide_index=True)
+elif isinstance(scan_df, pd.DataFrame) and scan_df.empty:
+    st.info("현재 필터 조건을 충족하는 AI 스캔 종목이 없습니다.")
+
+with st.expander("누적 AI 추천 리스트 & 성공/실패 통계 보기"):
+    stat_bundle = get_prediction_statistics()
+    if stat_bundle["total"] == 0:
+        st.caption("아직 저장된 AI 추천 코인 리스트가 없습니다.")
+    else:
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("누적 추천", f"{stat_bundle['total']:,}건")
+        k2.metric("판정 완료", f"{stat_bundle['settled']:,}건")
+        k3.metric("성공", f"{stat_bundle['success']:,}건")
+        k4.metric("실패", f"{stat_bundle['fail']:,}건")
+        k5.metric("실제 성공률", f"{stat_bundle['win_rate']}%")
+
+        reason_df = get_ai_reason_summary()
+        if not reason_df.empty:
+            st.dataframe(reason_df, use_container_width=True, hide_index=True)
+
+        target_stats_df = stat_bundle["target_stats"]
+        if not target_stats_df.empty:
+            st.dataframe(target_stats_df, use_container_width=True, hide_index=True)
+
+        filter_choice = st.radio(
+            "AI 로그 필터",
+            options=["전체", "성공", "실패", "대기중"],
+            horizontal=True,
+            key="ai_filter_radio",
+        )
+        logs_df = load_prediction_logs(limit=200, outcome_filter=filter_choice)
+        st.dataframe(logs_df, use_container_width=True, hide_index=True)
+
+with st.expander("DB 수집 현황 (1d / 240m / 60m) 보기"):
+    stats_df = load_db_stats()
+    if stats_df.empty:
+        st.caption("아직 DB에 수집된 캔들 데이터가 없습니다.")
+    else:
+        cols = st.columns(len(stats_df))
+        label_map = {"1d": "일봉 (1d)", "240m": "4시간봉 (240m)", "60m": "60분봉 (60m)"}
+        for idx, (_, r) in enumerate(stats_df.iterrows()):
+            with cols[idx]:
+                tf_label = label_map.get(r["timeframe"], r["timeframe"])
+                st.metric(
+                    label=tf_label,
+                    value=f"{int(r['candle_count']):,}개",
+                    delta=f"{int(r['coin_count']):,}개 코인",
+                )
+                st.caption(f"기간: {str(r['earliest_kst'])[:10]} ~ {str(r['latest_kst'])[:10]}")
