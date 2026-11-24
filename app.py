@@ -6,8 +6,9 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
@@ -35,6 +36,24 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
+
+
+# =====================================================================
+# 한국 시간(KST, UTC+9) 헬퍼
+# =====================================================================
+try:
+    KST_TZ = ZoneInfo("Asia/Seoul")
+except Exception:
+    KST_TZ = timezone(timedelta(hours=9))
+
+
+def now_kst() -> datetime:
+    """시간대 정보(tzinfo)가 제거된 순수 한국 시간(KST) naive datetime 반환"""
+    return datetime.now(KST_TZ).replace(tzinfo=None)
+
+
+def now_kst_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    return now_kst().strftime(fmt)
 
 
 # =====================================================================
@@ -111,7 +130,8 @@ def _parse_dt_safe(val) -> datetime | None:
         except ValueError:
             continue
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
     except Exception:
         return None
 
@@ -650,13 +670,14 @@ def models_ready() -> bool:
 
 
 # =====================================================================
-# 업그레이드된 단타 포착 및 30분 검증
+# 업그레이드된 단타 포착(초입 수급 필터 + KST 기준) 및 30분 검증
 # =====================================================================
 def _evaluate_single_spike(
     m: str,
     timeframe: str,
     min_vol_mult: float,
     min_ret_pct: float,
+    max_ret_pct: float,
     min_trade_krw: int,
     target_pct: float,
 ):
@@ -694,7 +715,7 @@ def _evaluate_single_spike(
     best_ret_pct = max(ret_vs_prev_pct, ret_candle_pct)
     trade_val_krw = float(latest.get("candle_acc_trade_price", cur_price * cur_vol))
 
-    # 직전 3봉 누적 상승률(과열/연속 급등 종목 제외용)
+    # 직전 3봉 누적 상승률(이미 연속 급등한 과열 구간 제외용)
     base_3_idx = min(3, len(raw) - 1)
     base_3_price = float(raw[base_3_idx]["trade_price"])
     cum_3_ret_pct = ((cur_price - base_3_price) / base_3_price) * 100.0 if base_3_price > 0 else 0.0
@@ -706,10 +727,10 @@ def _evaluate_single_spike(
     if not (
         cur_price > open_price
         and vol_mult >= min_vol_mult
-        and best_ret_pct >= min_ret_pct
+        and min_ret_pct <= best_ret_pct <= max_ret_pct
         and trade_val_krw >= min_trade_krw
-        and upper_wick_ratio < 0.55
-        and cum_3_ret_pct <= 8.0
+        and upper_wick_ratio < 0.45
+        and cum_3_ret_pct <= 9.0
     ):
         return None
 
@@ -748,8 +769,9 @@ def _evaluate_single_spike(
 
 def detect_volume_spikes(
     timeframe: str = "5m",
-    min_vol_mult: float = 2.5,
-    min_ret_pct: float = 1.2,
+    min_vol_mult: float = 4.0,
+    min_ret_pct: float = 1.5,
+    max_ret_pct: float = 12.0,
     min_trade_krw: int = 30_000_000,
     target_pct: float = 3.0,
     max_coins: int = 30,
@@ -767,7 +789,7 @@ def detect_volume_spikes(
 
     rows = []
     db_rows = []
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kst_now_str = now_kst_str("%Y-%m-%d %H:%M:%S")
     total_m = max(1, len(markets))
     done_m = 0
 
@@ -779,6 +801,7 @@ def detect_volume_spikes(
                 timeframe,
                 min_vol_mult,
                 min_ret_pct,
+                max_ret_pct,
                 min_trade_krw,
                 target_pct,
             )
@@ -793,7 +816,7 @@ def detect_volume_spikes(
             if res is not None:
                 disp, tup = res
                 rows.append(disp)
-                db_rows.append((now_str, *tup))
+                db_rows.append((kst_now_str, *tup))
 
     if save_to_db and db_rows:
         if progress_cb:
@@ -953,8 +976,8 @@ def verify_scalp_predictions(
             progress_cb(1.0, "검증할 대기 건 없음")
         return pd.DataFrame()
 
-    now_dt = datetime.now()
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    kst_now_dt = now_kst()
+    kst_now_str = kst_now_dt.strftime("%Y-%m-%d %H:%M:%S")
     updates = []
     total_l = max(1, len(logs))
     done_l = 0
@@ -966,7 +989,7 @@ def verify_scalp_predictions(
                 r.to_dict(),
                 expire_hours,
                 stop_loss_pct,
-                now_dt,
+                kst_now_dt,
             )
             for _, r in logs.iterrows()
         ]
@@ -978,7 +1001,7 @@ def verify_scalp_predictions(
             res = fut.result()
             if res is not None:
                 bought, max_gain_pct, outcome, status_detail, row_id = res
-                updates.append((bought, max_gain_pct, outcome, status_detail, now_str, row_id))
+                updates.append((bought, max_gain_pct, outcome, status_detail, kst_now_str, row_id))
 
     if updates:
         def _apply_updates(conn):
@@ -1139,7 +1162,7 @@ def _make_ui_progress_cb(bar, caption_box):
 # 화면 구성
 # =====================================================================
 st.title("📈 업비트 AI 코인 예측 스캐너")
-st.caption("스테이블코인 제외 · 1d/240m/60m AI 모델 + 최적화 단타 포착")
+st.caption("스테이블코인 제외 · 1d/240m/60m AI 모델 + 최적화 단타 포착 (KST 기준)")
 
 if "reset_nonce" not in st.session_state:
     st.session_state["reset_nonce"] = 0
@@ -1281,8 +1304,8 @@ st.subheader("3. 실시간 단타 포착 (거래대금 상위 30순 · 추천 �
 
 c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
 spike_tf = c1.selectbox("감지 봉", options=["5m", "15m"], index=0)
-min_vol_mult = c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, value=2.5, step=0.5)
-min_ret_pct = c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, value=1.2, step=0.5)
+min_vol_mult = c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, value=4.0, step=0.5)
+min_ret_pct = c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, value=1.5, step=0.5)
 target_pct = c4.slider("단타 목표수익 (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
 stop_loss_pct = c5.slider("단타 손절 기준 (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
 max_coins = c6.slider("거래대금 상위 탐색 수", min_value=10, max_value=296, value=30, step=10)
@@ -1298,6 +1321,7 @@ with b_col1:
                 timeframe=spike_tf,
                 min_vol_mult=min_vol_mult,
                 min_ret_pct=min_ret_pct,
+                max_ret_pct=12.0,
                 min_trade_krw=30_000_000,
                 target_pct=target_pct,
                 max_coins=max_coins,
