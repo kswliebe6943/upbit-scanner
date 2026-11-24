@@ -1,0 +1,1400 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import inspect
+import sqlite3
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+import pandas as pd
+import requests
+import streamlit as st
+
+import collector as upbit_collector
+from collector import (
+    DB_PATH,
+    STABLECOINS,
+    UPBIT_BASE_URL,
+    get_krw_markets,
+    init_db,
+)
+from predictor import (
+    MODEL_DIR,
+    TARGETS,
+    ensure_log_columns,
+    get_prediction_statistics,
+    scan_market,
+    train_models,
+    verify_predictions,
+)
+
+st.set_page_config(
+    page_title="업비트 AI 코인 스캐너",
+    page_icon="📈",
+    layout="wide",
+)
+
+
+# =====================================================================
+# SQLite 동시 접근 잠금(database is locked) 방지 연결 헬퍼
+# =====================================================================
+_DB_WRITE_LOCK = threading.Lock()
+
+
+def get_db_connection(timeout: float = 30.0) -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=timeout, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except sqlite3.OperationalError:
+        pass
+    return conn
+
+
+def _run_db_write(fn, max_retries: int = 8):
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            with _DB_WRITE_LOCK:
+                conn = get_db_connection(timeout=30.0)
+                try:
+                    res = fn(conn)
+                    conn.commit()
+                    return res
+                finally:
+                    conn.close()
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+
+
+def safe_init_db():
+    try:
+        _run_db_write(lambda _conn: init_db())
+    except Exception:
+        init_db()
+
+
+def safe_ensure_log_columns():
+    try:
+        _run_db_write(lambda _conn: ensure_log_columns())
+    except Exception:
+        ensure_log_columns()
+
+
+safe_init_db()
+safe_ensure_log_columns()
+
+
+# =====================================================================
+# 날짜 및 함수 호출 헬퍼
+# =====================================================================
+def _parse_dt_safe(val) -> datetime | None:
+    if val is None or pd.isna(val):
+        return None
+    s = str(val).strip().replace("T", " ")
+    if "+" in s:
+        s = s.split("+")[0].strip()
+    if "Z" in s:
+        s = s.replace("Z", "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _call_with_optional_progress(fn, *args, progress_cb=None, **kwargs):
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+    except Exception:
+        params = {}
+
+    for kw in ("progress_callback", "on_progress", "progress_cb", "callback"):
+        if kw in params and kw not in kwargs and progress_cb is not None:
+            kwargs[kw] = progress_cb
+            break
+    return fn(*args, **kwargs)
+
+
+def _get_default_target_count(timeframe: str) -> int:
+    const_map = {
+        "1d": ("TARGET_1D", "DAYS_COUNT", "DEFAULT_1D_COUNT", 365),
+        "240m": ("TARGET_240M", "HOURS_4_COUNT", "DEFAULT_240M_COUNT", 500),
+        "60m": ("TARGET_60M", "HOURS_1_COUNT", "DEFAULT_60M_COUNT", 500),
+    }
+    for attr_name in const_map.get(timeframe, ())[:-1]:
+        val = getattr(upbit_collector, attr_name, None)
+        if isinstance(val, int) and val > 0:
+            return val
+    return const_map.get(timeframe, (None, None, None, 365))[-1]
+
+
+def run_collector_direct(progress_cb=None):
+    if progress_cb:
+        progress_cb(0.05, "최신 캔들 수집 준비 중")
+
+    collect_fn = getattr(upbit_collector, "collect_timeframe_for_all", None)
+    if callable(collect_fn):
+        tf_plan = [
+            ("1d", _get_default_target_count("1d"), 0.10, 0.40),
+            ("240m", _get_default_target_count("240m"), 0.40, 0.72),
+            ("60m", _get_default_target_count("60m"), 0.72, 0.98),
+        ]
+        for tf, cnt, start_r, end_r in tf_plan:
+            if progress_cb:
+                progress_cb(start_r, f"[{tf}] 캔들 수집 중 (목표 {cnt}개)")
+            _call_with_optional_progress(collect_fn, tf, cnt, progress_cb=progress_cb)
+            if progress_cb:
+                progress_cb(end_r, f"[{tf}] 캔들 수집 완료")
+        if progress_cb:
+            progress_cb(1.0, "1d / 240m / 60m 최신 캔들 수집 완료")
+        return
+
+    for fn_name in (
+        "collect_all_timeframes",
+        "collect_all",
+        "collect_candles",
+        "collect_data",
+        "update_candles",
+        "update_all",
+        "sync_candles",
+        "run_collector",
+        "main",
+    ):
+        fn = getattr(upbit_collector, fn_name, None)
+        if callable(fn):
+            if progress_cb:
+                progress_cb(0.20, f"{fn_name}() 실행 중")
+            _call_with_optional_progress(fn, progress_cb=progress_cb)
+            if progress_cb:
+                progress_cb(1.0, "캔들 수집 완료")
+            return
+
+    collector_file = Path(upbit_collector.__file__)
+    if collector_file.exists():
+        if progress_cb:
+            progress_cb(0.20, "collector.py 직접 실행 중")
+        proc = subprocess.run(
+            [sys.executable, str(collector_file)],
+            cwd=str(collector_file.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode != 0:
+            err_tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            last_err = err_tail[-1] if err_tail else f"종료코드 {proc.returncode}"
+            raise RuntimeError(f"collector.py 실행 실패: {last_err}")
+        if progress_cb:
+            progress_cb(1.0, "캔들 수집 완료")
+        return
+
+    raise AttributeError("collector.py에서 수집 실행 함수를 찾지 못했습니다.")
+
+
+def run_training_direct(progress_cb=None):
+    if progress_cb:
+        progress_cb(0.15, "피처 생성 및 AI 모델 학습 중")
+    res = _call_with_optional_progress(train_models, progress_cb=progress_cb)
+    if progress_cb:
+        progress_cb(1.0, "AI 모델 학습 완료")
+    return res
+
+
+def run_scan_direct(top_n: int, min_prob_3: float, progress_cb=None) -> pd.DataFrame:
+    if progress_cb:
+        progress_cb(0.15, "전 종목 스캔 중")
+    sig = inspect.signature(scan_market)
+    kwargs = {"top_n": top_n, "min_prob_3": min_prob_3, "save_to_db": True}
+    for kw in ("progress_callback", "on_progress", "progress_cb", "callback"):
+        if kw in sig.parameters and progress_cb is not None:
+            kwargs[kw] = progress_cb
+            break
+    df = scan_market(**kwargs)
+    if progress_cb:
+        progress_cb(1.0, "전 종목 스캔 완료")
+    return df
+
+
+# =====================================================================
+# 업비트 API 및 한글명/금액 포맷 헬퍼
+# =====================================================================
+def _fast_get_json(url: str, params: dict, max_retries: int = 3):
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, timeout=5)
+            if resp.status_code == 429:
+                time.sleep(0.30 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            if attempt == max_retries - 1:
+                return []
+            time.sleep(0.15 * (attempt + 1))
+    return []
+
+
+def _fast_fetch_candles(market: str, timeframe: str = "5m", count: int = 25) -> list:
+    params = {"market": market, "count": max(1, min(200, int(count)))}
+    if timeframe == "1d":
+        url = f"{UPBIT_BASE_URL}/candles/days"
+    elif timeframe in {"1m", "5m", "15m", "60m", "240m"}:
+        mins = timeframe.replace("m", "")
+        url = f"{UPBIT_BASE_URL}/candles/minutes/{mins}"
+    else:
+        return []
+    data = _fast_get_json(url, params)
+    return data if isinstance(data, list) else []
+
+
+@st.cache_data(ttl=3600)
+def get_market_korean_name_map() -> dict:
+    data = _fast_get_json(f"{UPBIT_BASE_URL}/market/all", {"isDetails": "false"})
+    if not isinstance(data, list):
+        return {}
+    name_map = {}
+    for item in data:
+        m = item.get("market")
+        kor = item.get("korean_name")
+        if m and kor:
+            name_map[str(m)] = str(kor)
+    return name_map
+
+
+def format_coin_label(market_val) -> str:
+    if market_val is None or pd.isna(market_val):
+        return "-"
+    s = str(market_val).strip()
+    if "(" in s and s.endswith(")"):
+        return s
+    name_map = get_market_korean_name_map()
+    kor = name_map.get(s)
+    if kor:
+        return f"{s} ({kor})"
+    return s
+
+
+def attach_korean_coin_names(df: pd.DataFrame, col_name: str = "코인") -> pd.DataFrame:
+    if df is None or df.empty or col_name not in df.columns:
+        return df
+    out = df.copy()
+    out[col_name] = out[col_name].apply(format_coin_label)
+    return out
+
+
+def ensure_scalp_table():
+    def _create(conn):
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scalp_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_at TEXT NOT NULL,
+                market TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                current_price REAL NOT NULL,
+                rec_buy_price REAL NOT NULL,
+                rec_sell_price REAL NOT NULL,
+                target_pct REAL NOT NULL,
+                timing TEXT NOT NULL,
+                ret_pct REAL NOT NULL,
+                vol_mult REAL NOT NULL,
+                trade_val_krw REAL NOT NULL,
+                bought INTEGER DEFAULT 0,
+                max_gain_pct REAL DEFAULT 0.0,
+                outcome TEXT NOT NULL DEFAULT 'PENDING',
+                status_detail TEXT NOT NULL DEFAULT '대기중',
+                verified_at TEXT
+            )
+            """
+        )
+
+    _run_db_write(_create)
+
+
+ensure_scalp_table()
+
+
+def reset_scalp_logs():
+    ensure_scalp_table()
+    _run_db_write(lambda conn: conn.execute("DELETE FROM scalp_logs"))
+
+
+def reset_prediction_logs():
+    safe_ensure_log_columns()
+    _run_db_write(lambda conn: conn.execute("DELETE FROM prediction_logs"))
+
+
+def get_krw_markets_by_volume(limit: int = 30) -> list:
+    markets = get_krw_markets()
+    if not markets:
+        return []
+
+    tickers = []
+    chunk_size = 100
+    for i in range(0, len(markets), chunk_size):
+        batch = markets[i : i + chunk_size]
+        data = _fast_get_json(f"{UPBIT_BASE_URL}/ticker", {"markets": ",".join(batch)})
+        if isinstance(data, list):
+            tickers.extend(data)
+
+    if not tickers:
+        return markets[:limit]
+
+    vol_map = {
+        item.get("market"): float(item.get("acc_trade_price_24h", 0.0))
+        for item in tickers
+        if item.get("market") and item.get("market") not in STABLECOINS
+    }
+    sorted_markets = sorted(
+        [m for m in markets if m in vol_map],
+        key=lambda m: vol_map[m],
+        reverse=True,
+    )
+    return sorted_markets[:limit]
+
+
+def format_price(val: float) -> float:
+    if val >= 1000:
+        return float(round(val, 0))
+    if val >= 100:
+        return float(round(val, 1))
+    if val >= 10:
+        return float(round(val, 2))
+    if val >= 1:
+        return float(round(val, 3))
+    return float(round(val, 4))
+
+
+def _to_float_safe(val):
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    cleaned = str(val).replace(",", "").replace("원", "").strip()
+    if cleaned == "" or cleaned == "-":
+        return None
+    return float(cleaned)
+
+
+def fmt_krw(val) -> str:
+    num = _to_float_safe(val)
+    if num is None:
+        return "-"
+    if abs(num) >= 100:
+        return f"{num:,.0f}"
+    if abs(num) >= 10:
+        return f"{num:,.2f}".rstrip("0").rstrip(".")
+    return f"{num:,.4f}".rstrip("0").rstrip(".")
+
+
+def fmt_int_comma(val) -> str:
+    num = _to_float_safe(val)
+    if num is None:
+        return "-"
+    return f"{int(round(num)):,}"
+
+
+def format_price_columns(df: pd.DataFrame, price_cols: list, int_cols: list = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in price_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(fmt_krw)
+    if int_cols:
+        for col in int_cols:
+            if col in out.columns:
+                out[col] = out[col].apply(fmt_int_comma)
+    return out
+
+
+def build_scalp_plan(
+    cur_price: float,
+    open_price: float,
+    high_price: float,
+    low_price: float,
+    vol_mult: float,
+    ret_pct: float,
+    target_pct: float = 3.0,
+):
+    span = max(high_price - low_price, 0.0)
+    upper_wick_ratio = ((high_price - max(cur_price, open_price)) / span) if span > 0 else 0.0
+
+    # 30분 단타 체결률과 눌림 품질의 균형을 맞춘 매수가/타이밍 산출
+    if vol_mult >= 5.0 and ret_pct >= 4.5:
+        buy_raw = cur_price * 0.9965
+        timing = "과열 진정 후 눌림 (10~25분 내 -0.35% 부근 분할)"
+    elif upper_wick_ratio >= 0.35 or ret_pct >= 3.0:
+        buy_raw = cur_price * 0.9975
+        timing = "단기 눌림 대기 (5~20분 내 현재가 대비 -0.25% 부근)"
+    elif ret_pct >= 1.8:
+        buy_raw = cur_price * 0.9988
+        timing = "초단기 눌림 진입 (3~12분 내 현재가 대비 -0.12% 부근)"
+    else:
+        buy_raw = cur_price * 0.9996
+        timing = "즉시 진입 유효 (0~5분 내 현재가 부근)"
+
+    lower_bound = max(low_price * 0.998, cur_price * 0.994) if low_price > 0 else cur_price * 0.994
+    rec_buy = format_price(max(lower_bound, min(buy_raw, cur_price)))
+    rec_sell = format_price(rec_buy * (1.0 + max(0.5, float(target_pct)) / 100.0))
+    if rec_sell <= rec_buy:
+        rec_sell = format_price(rec_buy * 1.01)
+    return rec_buy, rec_sell, timing
+
+
+def _refine_ai_buy_window(row_series: pd.Series) -> str:
+    raw_win = str(row_series.get("expected_buy_window") or "").strip()
+    cur_p = _to_float_safe(row_series.get("current_price"))
+    buy_p = _to_float_safe(row_series.get("rec_buy_price"))
+
+    if cur_p and buy_p and cur_p > 0:
+        diff_pct = (buy_p - cur_p) / cur_p * 100.0
+        if diff_pct >= -0.15:
+            return "즉시~10분 내 진입 (현재가 근접)"
+        if diff_pct >= -0.5:
+            return "10~25분 내 눌림 진입 (-0.2%~-0.5%)"
+        if diff_pct >= -1.2:
+            return "25~45분 내 조정 진입 (-0.5%~-1.2%)"
+        return "45~90분 내 깊은 눌림 대기 (-1.2% 초과)"
+
+    if raw_win and raw_win not in ("-", "None", "nan", "1~3시간", "1~3시간 내"):
+        return raw_win
+    return "15~30분 내 눌림 확인 후 진입"
+
+
+def load_db_stats() -> pd.DataFrame:
+    conn = get_db_connection(timeout=30.0)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                timeframe,
+                COUNT(DISTINCT market) AS coin_count,
+                COUNT(*) AS candle_count,
+                MIN(candle_time_kst) AS earliest_kst,
+                MAX(candle_time_kst) AS latest_kst
+            FROM candles
+            GROUP BY timeframe
+            ORDER BY timeframe
+            """,
+            conn,
+        )
+        return df
+    finally:
+        conn.close()
+
+
+def _translate_outcome(val: str) -> str:
+    return {
+        "SUCCESS": "성공",
+        "FAIL": "실패",
+        "PENDING": "대기중",
+    }.get(str(val), str(val))
+
+
+def _translate_status(val: str) -> str:
+    return {
+        "PENDING": "대기중",
+        "BOUGHT": "매수체결",
+        "HIT_3": "+3% 도달",
+        "HIT_5": "+5% 도달",
+        "HIT_10": "+10% 도달",
+        "HIT_20": "+20% 도달",
+        "STOPPED": "손절이탈",
+        "UNFILLED": "미체결종료",
+        "EXPIRED": "기간만료(미달)",
+    }.get(str(val), str(val))
+
+
+def _classify_ai_reason(row) -> str:
+    outcome = str(row.get("outcome") or "").upper()
+    status = str(row.get("status") or "").upper()
+    detail = str(row.get("status_detail") or "").strip() if "status_detail" in row else ""
+
+    if outcome == "PENDING":
+        return "대기중 (판정 전)"
+
+    combined = f"{status} {detail}".upper()
+    if outcome == "SUCCESS":
+        if "HIT_20" in combined or "+20%" in combined or "20%" in combined:
+            return "성공: 목표(+20%) 도달"
+        if "HIT_10" in combined or "+10%" in combined or "10%" in combined:
+            return "성공: 목표(+10%) 도달"
+        if "HIT_5" in combined or "+5%" in combined or "5%" in combined:
+            return "성공: 목표(+5%) 도달"
+        if "HIT_3" in combined or "+3%" in combined or "3%" in combined:
+            return "성공: 목표(+3%) 도달"
+        return f"성공: {detail}" if detail else "성공: 목표가 도달"
+
+    if "STOP" in combined or "손절" in combined:
+        return "실패: 손절가 이탈"
+    if "UNFILL" in combined or "미체결" in combined:
+        return "실패: 추천매수가 미체결"
+    if "EXPIRE" in combined or "만료" in combined or "미달" in combined:
+        return "실패: 기간 내 목표가 미달"
+    return f"실패: {detail}" if detail else "실패: 목표 미달/조건 미충족"
+
+
+def get_ai_reason_summary() -> pd.DataFrame:
+    safe_ensure_log_columns()
+    conn = get_db_connection(timeout=30.0)
+    try:
+        df = pd.read_sql_query("SELECT * FROM prediction_logs ORDER BY id DESC", conn)
+    finally:
+        conn.close()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df["_reason"] = df.apply(_classify_ai_reason, axis=1)
+    settled = df[df["outcome"].isin(["SUCCESS", "FAIL"])]
+    if settled.empty:
+        return pd.DataFrame()
+
+    grp = (
+        settled.groupby("_reason", as_index=False)
+        .size()
+        .rename(columns={"_reason": "판정사유", "size": "건수"})
+        .sort_values(by="건수", ascending=False)
+        .reset_index(drop=True)
+    )
+    total_settled = len(settled)
+    grp["비중(%)"] = grp["건수"].apply(lambda c: round(c / total_settled * 100.0, 1))
+    grp["건수"] = grp["건수"].apply(fmt_int_comma)
+    return grp
+
+
+def load_prediction_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.DataFrame:
+    conn = get_db_connection(timeout=30.0)
+    try:
+        base_sql = """
+            SELECT
+                id, predicted_at, market, current_price, rec_buy_price, stop_loss,
+                target_3, target_5, target_10, target_20,
+                prob_3, prob_5, prob_10, prob_20,
+                max_gain_pct, status, outcome, expected_buy_window, verified_at
+            FROM prediction_logs
+        """
+        code_map = {"성공": "SUCCESS", "실패": "FAIL", "대기중": "PENDING"}
+        if outcome_filter in code_map:
+            df = pd.read_sql_query(
+                base_sql + " WHERE outcome = ? ORDER BY id DESC LIMIT ?",
+                conn,
+                params=(code_map[outcome_filter], limit),
+            )
+        else:
+            df = pd.read_sql_query(
+                base_sql + " ORDER BY id DESC LIMIT ?",
+                conn,
+                params=(limit,),
+            )
+    finally:
+        conn.close()
+
+    if df.empty:
+        return df
+
+    df["판정사유"] = df.apply(_classify_ai_reason, axis=1)
+    df["expected_buy_window"] = df.apply(_refine_ai_buy_window, axis=1)
+    df["status"] = df["status"].apply(_translate_status)
+    df["outcome"] = df["outcome"].apply(_translate_outcome)
+
+    renamed = df.rename(columns={
+        "id": "번호",
+        "predicted_at": "예측(포착)시각",
+        "market": "코인",
+        "current_price": "포착시점현재가",
+        "rec_buy_price": "추천매수가",
+        "stop_loss": "손절가",
+        "target_3": "목표+3%",
+        "target_5": "목표+5%",
+        "target_10": "목표+10%",
+        "target_20": "목표+20%",
+        "prob_3": "+3%확률(%)",
+        "prob_5": "+5%확률(%)",
+        "prob_10": "+10%확률(%)",
+        "prob_20": "+20%확률(%)",
+        "max_gain_pct": "최고수익(%)",
+        "status": "진행상태",
+        "outcome": "결과",
+        "expected_buy_window": "예상매수시점",
+        "verified_at": "검증시각",
+    })
+    renamed = attach_korean_coin_names(renamed, col_name="코인")
+    return format_price_columns(
+        renamed,
+        price_cols=["포착시점현재가", "추천매수가", "손절가", "목표+3%", "목표+5%", "목표+10%", "목표+20%"],
+        int_cols=["번호"],
+    )
+
+
+def models_ready() -> bool:
+    return all((MODEL_DIR / f"lgb_target_{pct}.txt").exists() for pct in TARGETS)
+
+
+# =====================================================================
+# 업그레이드된 단타 포착 및 30분 검증
+# =====================================================================
+def _evaluate_single_spike(
+    m: str,
+    timeframe: str,
+    min_vol_mult: float,
+    min_ret_pct: float,
+    min_trade_krw: int,
+    target_pct: float,
+):
+    time.sleep(0.03)
+    raw = _fast_fetch_candles(m, timeframe=timeframe, count=24)
+    if not raw or len(raw) < 7:
+        return None
+
+    latest = raw[0]
+    prev = raw[1]
+
+    hist_vols = [
+        float(c.get("candle_acc_trade_volume", c.get("candle_acc_volume", 0.0)))
+        for c in raw[1:21]
+        if float(c.get("candle_acc_trade_volume", c.get("candle_acc_volume", 0.0))) > 0
+    ]
+    if not hist_vols:
+        return None
+
+    median_vol = float(statistics.median(hist_vols))
+    cur_vol = float(latest.get("candle_acc_trade_volume", latest.get("candle_acc_volume", 0.0)))
+    vol_mult = (cur_vol / median_vol) if median_vol > 0 else 0.0
+
+    cur_price = float(latest["trade_price"])
+    prev_close = float(prev["trade_price"])
+    open_price = float(latest["opening_price"])
+    high_price = float(latest["high_price"])
+    low_price = float(latest["low_price"])
+
+    if cur_price <= 0 or open_price <= 0 or prev_close <= 0:
+        return None
+
+    ret_vs_prev_pct = ((cur_price - prev_close) / prev_close) * 100.0
+    ret_candle_pct = ((cur_price - open_price) / open_price) * 100.0
+    best_ret_pct = max(ret_vs_prev_pct, ret_candle_pct)
+    trade_val_krw = float(latest.get("candle_acc_trade_price", cur_price * cur_vol))
+
+    # 직전 3봉 누적 상승률(과열/연속 급등 종목 제외용)
+    base_3_idx = min(3, len(raw) - 1)
+    base_3_price = float(raw[base_3_idx]["trade_price"])
+    cum_3_ret_pct = ((cur_price - base_3_price) / base_3_price) * 100.0 if base_3_price > 0 else 0.0
+
+    # 윗꼬리 비율(고점 매물/휩소 회피용)
+    candle_span = max(high_price - low_price, 0.0)
+    upper_wick_ratio = ((high_price - max(cur_price, open_price)) / candle_span) if candle_span > 0 else 0.0
+
+    if not (
+        cur_price > open_price
+        and vol_mult >= min_vol_mult
+        and best_ret_pct >= min_ret_pct
+        and trade_val_krw >= min_trade_krw
+        and upper_wick_ratio < 0.55
+        and cum_3_ret_pct <= 8.0
+    ):
+        return None
+
+    rec_buy, rec_sell, timing = build_scalp_plan(
+        cur_price=cur_price,
+        open_price=open_price,
+        high_price=high_price,
+        low_price=low_price,
+        vol_mult=vol_mult,
+        ret_pct=best_ret_pct,
+        target_pct=target_pct,
+    )
+    cur_fmt = format_price(cur_price)
+    ret_fmt = round(best_ret_pct, 2)
+    vol_fmt = round(vol_mult, 2)
+    val_man = int(trade_val_krw // 10_000)
+
+    display_row = {
+        "코인": format_coin_label(m),
+        "추천매수금액": rec_buy,
+        "추천매도금액": rec_sell,
+        "추천매수타이밍": timing,
+        "포착시점현재가": cur_fmt,
+        "상승률(%)": ret_fmt,
+        "거래량배율(배)": vol_fmt,
+        "거래대금(만원)": val_man,
+        "봉": timeframe,
+    }
+    db_tuple = (
+        m, timeframe, cur_fmt,
+        rec_buy, rec_sell, float(target_pct), timing,
+        ret_fmt, vol_fmt, trade_val_krw,
+    )
+    return display_row, db_tuple
+
+
+def detect_volume_spikes(
+    timeframe: str = "5m",
+    min_vol_mult: float = 2.5,
+    min_ret_pct: float = 1.2,
+    min_trade_krw: int = 30_000_000,
+    target_pct: float = 3.0,
+    max_coins: int = 30,
+    save_to_db: bool = True,
+    progress_cb=None,
+) -> pd.DataFrame:
+    ensure_scalp_table()
+    if progress_cb:
+        progress_cb(0.10, "거래대금 상위 마켓 조회 중")
+    markets = get_krw_markets_by_volume(limit=max_coins)
+    if not markets:
+        if progress_cb:
+            progress_cb(1.0, "대상 마켓 없음")
+        return pd.DataFrame()
+
+    rows = []
+    db_rows = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_m = max(1, len(markets))
+    done_m = 0
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [
+            executor.submit(
+                _evaluate_single_spike,
+                m,
+                timeframe,
+                min_vol_mult,
+                min_ret_pct,
+                min_trade_krw,
+                target_pct,
+            )
+            for m in markets
+        ]
+        for fut in as_completed(futures):
+            done_m += 1
+            if progress_cb:
+                ratio = 0.10 + 0.75 * (done_m / total_m)
+                progress_cb(ratio, f"단타 종목 분석 중 ({done_m}/{total_m})")
+            res = fut.result()
+            if res is not None:
+                disp, tup = res
+                rows.append(disp)
+                db_rows.append((now_str, *tup))
+
+    if save_to_db and db_rows:
+        if progress_cb:
+            progress_cb(0.90, "단타 포착 로그 DB 저장 중")
+
+        def _insert_scalp(conn):
+            conn.executemany(
+                """
+                INSERT INTO scalp_logs (
+                    detected_at, market, timeframe, current_price,
+                    rec_buy_price, rec_sell_price, target_pct, timing,
+                    ret_pct, vol_mult, trade_val_krw,
+                    bought, max_gain_pct, outcome, status_detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0.0, 'PENDING', '대기중')
+                """,
+                db_rows,
+            )
+
+        _run_db_write(_insert_scalp)
+
+    if progress_cb:
+        progress_cb(1.0, "단타 포착 완료")
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(by=["거래량배율(배)", "상승률(%)"], ascending=False).reset_index(drop=True)
+    return df
+
+
+def _filter_window_candles(raw_candles: list, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    if not raw_candles:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw_candles)
+    if "candle_date_time_kst" not in df.columns:
+        return pd.DataFrame()
+
+    df["_dt"] = df["candle_date_time_kst"].apply(_parse_dt_safe)
+    df = df.dropna(subset=["_dt"])
+    if df.empty:
+        return pd.DataFrame()
+
+    window_df = df[(df["_dt"] >= (start_dt - timedelta(minutes=1))) & (df["_dt"] <= end_dt)].copy()
+    return window_df.sort_values("_dt")
+
+
+def _verify_single_scalp(
+    row_dict: dict,
+    expire_hours: float,
+    stop_loss_pct: float,
+    now_dt: datetime,
+):
+    det_dt = _parse_dt_safe(row_dict.get("detected_at"))
+    if det_dt is None:
+        return None
+
+    market = row_dict["market"]
+    window_minutes = max(1, int(round(expire_hours * 60)))
+    end_dt = det_dt + timedelta(minutes=window_minutes)
+    elapsed_minutes = (now_dt - det_dt).total_seconds() / 60.0
+
+    # 경과 시간에 맞춰 필요한 분봉 수만 조회해 API 호출 부하 절감
+    needed_1m = int(min(120, max(10, elapsed_minutes + 5)))
+    raw_1m = _fast_fetch_candles(market, timeframe="1m", count=needed_1m)
+    time.sleep(0.03)
+    raw_5m = _fast_fetch_candles(market, timeframe="5m", count=20)
+
+    w_1m = _filter_window_candles(raw_1m, det_dt, min(now_dt, end_dt))
+    w_5m = _filter_window_candles(raw_5m, det_dt, min(now_dt, end_dt))
+
+    lows, highs = [], []
+    if not w_1m.empty:
+        lows.append(float(w_1m["low_price"].min()))
+        highs.append(float(w_1m["high_price"].max()))
+    if not w_5m.empty:
+        lows.append(float(w_5m["low_price"].min()))
+        highs.append(float(w_5m["high_price"].max()))
+
+    if not lows or not highs:
+        if elapsed_minutes < window_minutes:
+            return None
+        min_low = float(row_dict["current_price"])
+        max_high = float(row_dict["current_price"])
+    else:
+        min_low = min(lows)
+        max_high = max(highs)
+
+    rec_buy = float(row_dict["rec_buy_price"])
+    rec_sell = float(row_dict["rec_sell_price"])
+    stop_price = rec_buy * (1.0 - max(0.0, float(stop_loss_pct)) / 100.0)
+    bought = int(bool(row_dict["bought"]) or (min_low <= rec_buy))
+
+    base_ref = rec_buy if bought else float(row_dict["current_price"])
+    cur_gain_pct = ((max_high - base_ref) / base_ref * 100.0) if base_ref > 0 else 0.0
+    max_gain_pct = round(max(float(row_dict["max_gain_pct"] or 0.0), cur_gain_pct), 2)
+
+    outcome = row_dict["outcome"]
+    status_detail = row_dict["status_detail"]
+
+    if bought and stop_loss_pct > 0 and min_low <= stop_price:
+        outcome = "FAIL"
+        status_detail = f"{window_minutes}분 내 손절가(-{stop_loss_pct:.1f}% / {fmt_krw(stop_price)}) 이탈"
+    elif bought and max_high >= rec_sell:
+        outcome = "SUCCESS"
+        status_detail = f"{window_minutes}분 내 매수({fmt_krw(rec_buy)})·목표({fmt_krw(rec_sell)}) 도달"
+    elif elapsed_minutes >= window_minutes:
+        outcome = "FAIL"
+        status_detail = (
+            f"{window_minutes}분 내 목표가 미달 (최저 {fmt_krw(min_low)} / 최고 {fmt_krw(max_high)})"
+            if bought
+            else f"{window_minutes}분 내 매수가({fmt_krw(rec_buy)}) 미도달 (최저 {fmt_krw(min_low)})"
+        )
+    else:
+        remain_min = max(1, int(round(window_minutes - elapsed_minutes)))
+        status_detail = (
+            f"대기중 (매수체결 · 남은 {remain_min}분)"
+            if bought
+            else f"대기중 (매수가 대기 · 남은 {remain_min}분)"
+        )
+
+    changed = (
+        bought != int(row_dict["bought"] or 0)
+        or max_gain_pct != float(row_dict["max_gain_pct"] or 0.0)
+        or outcome != row_dict["outcome"]
+        or status_detail != row_dict["status_detail"]
+    )
+    if not changed:
+        return None
+
+    return (bought, max_gain_pct, outcome, status_detail, int(row_dict["id"]))
+
+
+def verify_scalp_predictions(
+    expire_hours: float = 0.5,
+    stop_loss_pct: float = 1.5,
+    progress_cb=None,
+) -> pd.DataFrame:
+    ensure_scalp_table()
+    if progress_cb:
+        progress_cb(0.10, "단타 대기 로그 조회 중")
+    conn = get_db_connection(timeout=30.0)
+    try:
+        logs = pd.read_sql_query(
+            """
+            SELECT * FROM scalp_logs
+            WHERE outcome = 'PENDING'
+            ORDER BY id ASC
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if logs.empty:
+        if progress_cb:
+            progress_cb(1.0, "검증할 대기 건 없음")
+        return pd.DataFrame()
+
+    now_dt = datetime.now()
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    updates = []
+    total_l = max(1, len(logs))
+    done_l = 0
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [
+            executor.submit(
+                _verify_single_scalp,
+                r.to_dict(),
+                expire_hours,
+                stop_loss_pct,
+                now_dt,
+            )
+            for _, r in logs.iterrows()
+        ]
+        for fut in as_completed(futures):
+            done_l += 1
+            if progress_cb:
+                ratio = 0.10 + 0.80 * (done_l / total_l)
+                progress_cb(ratio, f"단타 로그 검증 중 ({done_l}/{total_l})")
+            res = fut.result()
+            if res is not None:
+                bought, max_gain_pct, outcome, status_detail, row_id = res
+                updates.append((bought, max_gain_pct, outcome, status_detail, now_str, row_id))
+
+    if updates:
+        def _apply_updates(conn):
+            conn.executemany(
+                """
+                UPDATE scalp_logs
+                SET bought = ?, max_gain_pct = ?, outcome = ?, status_detail = ?, verified_at = ?
+                WHERE id = ?
+                """,
+                updates,
+            )
+
+        _run_db_write(_apply_updates)
+
+    conn = get_db_connection(timeout=30.0)
+    try:
+        summary = pd.read_sql_query(
+            "SELECT outcome, COUNT(*) AS cnt FROM scalp_logs GROUP BY outcome",
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if progress_cb:
+        progress_cb(1.0, f"단타 검증 완료 ({len(updates)}건 갱신)")
+    return summary
+
+
+def get_scalp_statistics() -> dict:
+    ensure_scalp_table()
+    conn = get_db_connection(timeout=30.0)
+    try:
+        df = pd.read_sql_query("SELECT * FROM scalp_logs ORDER BY id DESC", conn)
+    finally:
+        conn.close()
+
+    if df.empty:
+        return {
+            "total": 0,
+            "settled": 0,
+            "success": 0,
+            "fail": 0,
+            "win_rate": 0.0,
+            "avg_max_gain": 0.0,
+            "by_vol": pd.DataFrame(),
+        }
+
+    settled_df = df[df["outcome"].isin(["SUCCESS", "FAIL"])]
+    total = len(df)
+    settled = len(settled_df)
+    success = int((settled_df["outcome"] == "SUCCESS").sum())
+    fail = int((settled_df["outcome"] == "FAIL").sum())
+    win_rate = round((success / settled * 100.0), 1) if settled > 0 else 0.0
+    avg_max_gain = round(float(settled_df["max_gain_pct"].mean()), 2) if settled > 0 else 0.0
+
+    vol_rows = []
+    buckets = [
+        ("2.5배 ~ 3.5배", 2.5, 3.5),
+        ("3.5배 ~ 5.0배", 3.5, 5.0),
+        ("5.0배 이상", 5.0, 999.0),
+    ]
+    for label, lo, hi in buckets:
+        sub_all = df[(df["vol_mult"] >= lo) & (df["vol_mult"] < hi)]
+        sub_set = settled_df[(settled_df["vol_mult"] >= lo) & (settled_df["vol_mult"] < hi)]
+        s_cnt = int((sub_set["outcome"] == "SUCCESS").sum())
+        tot_s = len(sub_set)
+        rate = round((s_cnt / tot_s * 100.0), 1) if tot_s > 0 else 0.0
+        vol_rows.append({
+            "거래량배율구간": label,
+            "포착건수": fmt_int_comma(len(sub_all)),
+            "판정건수": fmt_int_comma(tot_s),
+            "성공건수": fmt_int_comma(s_cnt),
+            "실제성공률(%)": rate,
+        })
+
+    return {
+        "total": total,
+        "settled": settled,
+        "success": success,
+        "fail": fail,
+        "win_rate": win_rate,
+        "avg_max_gain": avg_max_gain,
+        "by_vol": pd.DataFrame(vol_rows),
+    }
+
+
+def load_scalp_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.DataFrame:
+    ensure_scalp_table()
+    conn = get_db_connection(timeout=30.0)
+    try:
+        base_sql = """
+            SELECT
+                id, detected_at, market, timeframe, current_price,
+                rec_buy_price, rec_sell_price, target_pct, timing,
+                ret_pct, vol_mult, bought, max_gain_pct,
+                outcome, status_detail, verified_at
+            FROM scalp_logs
+        """
+        code_map = {"성공": "SUCCESS", "실패": "FAIL", "대기중": "PENDING"}
+        if outcome_filter in code_map:
+            df = pd.read_sql_query(
+                base_sql + " WHERE outcome = ? ORDER BY id DESC LIMIT ?",
+                conn,
+                params=(code_map[outcome_filter], limit),
+            )
+        else:
+            df = pd.read_sql_query(
+                base_sql + " ORDER BY id DESC LIMIT ?",
+                conn,
+                params=(limit,),
+            )
+    finally:
+        conn.close()
+
+    if df.empty:
+        return df
+
+    df["bought"] = df["bought"].apply(lambda x: "체결됨" if int(x or 0) == 1 else "미체결")
+    df["outcome"] = df["outcome"].apply(_translate_outcome)
+    df["status_detail"] = df["status_detail"].replace({"PENDING": "대기중"})
+
+    renamed = df.rename(columns={
+        "id": "번호",
+        "detected_at": "포착시각",
+        "market": "코인",
+        "timeframe": "봉",
+        "current_price": "포착시점현재가",
+        "rec_buy_price": "추천매수금액",
+        "rec_sell_price": "추천매도금액",
+        "target_pct": "목표(%)",
+        "timing": "추천매수타이밍",
+        "ret_pct": "상승률(%)",
+        "vol_mult": "거래량배율(배)",
+        "bought": "매수여부",
+        "max_gain_pct": "최고수익(%)",
+        "outcome": "결과",
+        "status_detail": "상세상태",
+        "verified_at": "검증시각",
+    })
+    renamed = attach_korean_coin_names(renamed, col_name="코인")
+    return format_price_columns(
+        renamed,
+        price_cols=["포착시점현재가", "추천매수금액", "추천매도금액"],
+        int_cols=["번호"],
+    )
+
+
+def _make_ui_progress_cb(bar, caption_box):
+    def _cb(ratio: float, msg: str = ""):
+        clamped = max(0.0, min(1.0, float(ratio)))
+        pct = int(round(clamped * 100))
+        bar.progress(clamped)
+        caption_box.caption(f"⏳ {msg} ({pct}%)" if msg else f"⏳ 진행 중 ({pct}%)")
+    return _cb
+
+
+# =====================================================================
+# 화면 구성
+# =====================================================================
+st.title("📈 업비트 AI 코인 예측 스캐너")
+st.caption("스테이블코인 제외 · 1d/240m/60m AI 모델 + 최적화 단타 포착")
+
+if "reset_nonce" not in st.session_state:
+    st.session_state["reset_nonce"] = 0
+if "last_reset_msg" not in st.session_state:
+    st.session_state["last_reset_msg"] = None
+if "scan_result_df" not in st.session_state:
+    st.session_state["scan_result_df"] = None
+if "scalp_result_df" not in st.session_state:
+    st.session_state["scalp_result_df"] = None
+
+with st.sidebar:
+    st.header("⚙️ 제어 패널")
+    top_n = st.slider("표시할 상위 코인 수", min_value=3, max_value=30, value=10, step=1)
+    min_prob_3 = st.slider("최소 +3% 상승 확률 필터 (%)", min_value=30, max_value=85, value=55, step=5) / 100.0
+    success_target = st.selectbox("AI 성공 판정 기준 목표", options=[3, 5, 10, 20], index=0)
+
+    if st.button("🔄 화면 새로고침", use_container_width=True):
+        st.rerun()
+
+    st.divider()
+    if st.button("📥 최신 캔들 데이터 수집", use_container_width=True):
+        p_bar = st.progress(0.02)
+        p_cap = st.empty()
+        cb = _make_ui_progress_cb(p_bar, p_cap)
+        try:
+            run_collector_direct(progress_cb=cb)
+            p_bar.progress(1.0)
+            p_cap.caption("✅ 최신 캔들 수집 완료 (100%)")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"❌ 수집 오류: {type(exc).__name__}: {exc}")
+
+    st.divider()
+    if st.button("🧠 AI 모델 학습/재학습", use_container_width=True):
+        p_bar = st.progress(0.05)
+        p_cap = st.empty()
+        cb = _make_ui_progress_cb(p_bar, p_cap)
+        try:
+            run_training_direct(progress_cb=cb)
+            p_bar.progress(1.0)
+            p_cap.caption("✅ AI 모델 학습 완료 (100%)")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"❌ 학습 오류: {type(exc).__name__}: {exc}")
+
+    st.divider()
+    if st.button("🔍 지금 전 종목 스캔", type="primary", use_container_width=True):
+        p_bar = st.progress(0.05)
+        p_cap = st.empty()
+        cb = _make_ui_progress_cb(p_bar, p_cap)
+        try:
+            df_res = run_scan_direct(top_n=top_n, min_prob_3=min_prob_3, progress_cb=cb)
+            st.session_state["scan_result_df"] = df_res
+            p_bar.progress(1.0)
+            p_cap.caption("✅ 전 종목 스캔 완료 (100%)")
+        except Exception as exc:
+            st.error(f"❌ 스캔 오류: {type(exc).__name__}: {exc}")
+
+    st.divider()
+    if st.button("✅ AI 성공여부 검증", use_container_width=True):
+        p_bar = st.progress(0.10)
+        p_cap = st.empty()
+        cb = _make_ui_progress_cb(p_bar, p_cap)
+        try:
+            _call_with_optional_progress(verify_predictions, progress_cb=cb, success_target_pct=success_target)
+            p_bar.progress(1.0)
+            p_cap.caption("✅ AI 성공여부 검증 완료 (100%)")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"❌ AI 검증 오류: {type(exc).__name__}: {exc}")
+
+    st.divider()
+    st.subheader("🗑️ 로그 및 통계 초기화")
+    nonce = st.session_state["reset_nonce"]
+    reset_scalp_chk = st.checkbox("단타 통계 초기화 대상 포함", key=f"chk_reset_scalp_{nonce}")
+    reset_ai_chk = st.checkbox("AI 통계 초기화 대상 포함", key=f"chk_reset_ai_{nonce}")
+    confirm_reset_chk = st.checkbox("삭제 실행 확인", key=f"chk_confirm_reset_{nonce}")
+
+    if st.session_state["last_reset_msg"]:
+        st.success(st.session_state["last_reset_msg"])
+        st.session_state["last_reset_msg"] = None
+
+    can_reset = (reset_scalp_chk or reset_ai_chk) and confirm_reset_chk
+    if st.button("🧹 선택 통계 초기화 실행", use_container_width=True, disabled=not can_reset):
+        cleared = []
+        if reset_scalp_chk:
+            reset_scalp_logs()
+            st.session_state["scalp_result_df"] = None
+            cleared.append("단타 통계")
+        if reset_ai_chk:
+            reset_prediction_logs()
+            st.session_state["scan_result_df"] = None
+            cleared.append("AI 통계")
+
+        st.session_state["reset_nonce"] = nonce + 1
+        st.session_state["last_reset_msg"] = f"{' · '.join(cleared)} 초기화 완료!"
+        st.rerun()
+
+# 1. DB 수집 현황
+st.subheader("1. DB 수집 현황 (1d / 240m / 60m)")
+stats_df = load_db_stats()
+if stats_df.empty:
+    st.warning("아직 DB에 수집된 캔들 데이터가 없습니다. 왼쪽 **'최신 캔들 데이터 수집'** 버튼을 눌러주세요.")
+else:
+    cols = st.columns(len(stats_df))
+    label_map = {"1d": "일봉 (1d)", "240m": "4시간봉 (240m)", "60m": "60분봉 (60m)"}
+    for idx, (_, r) in enumerate(stats_df.iterrows()):
+        with cols[idx]:
+            tf_label = label_map.get(r["timeframe"], r["timeframe"])
+            st.metric(
+                label=tf_label,
+                value=f"{int(r['candle_count']):,}개",
+                delta=f"{int(r['coin_count']):,}개 코인",
+            )
+            st.caption(f"기간: {str(r['earliest_kst'])[:10]} ~ {str(r['latest_kst'])[:10]}")
+
+st.divider()
+
+# 2. AI 스캔 결과
+st.subheader("2. AI 상승 확률 · 추천 매수/매도가 · 예상 매수 시점")
+if not models_ready():
+    st.info("아직 학습된 모델 파일(`models/lgb_target_*.txt`)이 없습니다. 데이터가 모인 뒤 왼쪽 **'AI 모델 학습/재학습'**을 눌러주세요.")
+
+scan_df = st.session_state.get("scan_result_df")
+if isinstance(scan_df, pd.DataFrame) and not scan_df.empty:
+    formatted_scan = attach_korean_coin_names(scan_df, col_name="코인")
+    formatted_scan = format_price_columns(
+        formatted_scan,
+        price_cols=["현재가", "추천매수가", "손절가", "목표+3%", "목표+5%", "목표+10%", "목표+20%"],
+    )
+    st.dataframe(formatted_scan, use_container_width=True, hide_index=True)
+elif isinstance(scan_df, pd.DataFrame) and scan_df.empty:
+    st.info("현재 필터 조건을 충족하는 코인이 없습니다. 확률 기준을 낮춰 다시 스캔해 보세요.")
+
+st.divider()
+
+# 3. 실시간 단타 포착 & 30분 단타 성공/실패 통계
+st.subheader("3. 실시간 단타 포착 (거래대금 상위 30순 · 추천 매수·매도가 & 타이밍)")
+
+c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
+spike_tf = c1.selectbox("감지 봉", options=["5m", "15m"], index=0)
+min_vol_mult = c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, value=2.5, step=0.5)
+min_ret_pct = c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, value=1.2, step=0.5)
+target_pct = c4.slider("단타 목표수익 (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+stop_loss_pct = c5.slider("단타 손절 기준 (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
+max_coins = c6.slider("거래대금 상위 탐색 수", min_value=10, max_value=296, value=30, step=10)
+
+b_col1, b_col2 = st.columns([2, 1])
+with b_col1:
+    if st.button("⚡ 지금 단타 종목 포착하기", use_container_width=True):
+        s_bar = st.progress(0.05)
+        s_cap = st.empty()
+        s_cb = _make_ui_progress_cb(s_bar, s_cap)
+        try:
+            sp_df = detect_volume_spikes(
+                timeframe=spike_tf,
+                min_vol_mult=min_vol_mult,
+                min_ret_pct=min_ret_pct,
+                min_trade_krw=30_000_000,
+                target_pct=target_pct,
+                max_coins=max_coins,
+                save_to_db=True,
+                progress_cb=s_cb,
+            )
+            st.session_state["scalp_result_df"] = sp_df
+            s_bar.progress(1.0)
+            s_cap.caption("✅ 단타 포착 완료 (100%)")
+        except Exception as exc:
+            st.error(f"❌ 단타 포착 오류: {type(exc).__name__}: {exc}")
+
+with b_col2:
+    if st.button("✅ 단타 성공/실패 검증 (30분)", use_container_width=True):
+        v_bar = st.progress(0.05)
+        v_cap = st.empty()
+        v_cb = _make_ui_progress_cb(v_bar, v_cap)
+        try:
+            verify_scalp_predictions(expire_hours=0.5, stop_loss_pct=stop_loss_pct, progress_cb=v_cb)
+            v_bar.progress(1.0)
+            v_cap.caption("✅ 단타 검증 완료 (100%)")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"❌ 단타 검증 오류: {type(exc).__name__}: {exc}")
+
+spike_df = st.session_state.get("scalp_result_df")
+if isinstance(spike_df, pd.DataFrame) and not spike_df.empty:
+    formatted_spike = attach_korean_coin_names(spike_df, col_name="코인")
+    formatted_spike = format_price_columns(
+        formatted_spike,
+        price_cols=["추천매수금액", "추천매도금액", "포착시점현재가"],
+        int_cols=["거래대금(만원)"],
+    )
+    st.dataframe(formatted_spike, use_container_width=True, hide_index=True)
+elif isinstance(spike_df, pd.DataFrame) and spike_df.empty:
+    st.info("현재 조건에 맞는 단타 종목이 없습니다. 거래량 배율이나 최소 상승률을 조금 낮춰 다시 눌러보세요.")
+
+st.markdown("#### 실시간 단타 포착 성공/실패 통계 (30분·손절 기준)")
+scalp_stat = get_scalp_statistics()
+if scalp_stat["total"] == 0:
+    st.caption("아직 저장된 단타 포착 로그가 없습니다. **'지금 단타 종목 포착하기'**를 누르면 자동으로 기록됩니다.")
+else:
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("누적 단타 포착", f"{scalp_stat['total']:,}건")
+    s2.metric("판정 완료", f"{scalp_stat['settled']:,}건")
+    s3.metric("성공", f"{scalp_stat['success']:,}건")
+    s4.metric("실패", f"{scalp_stat['fail']:,}건")
+    s5.metric("단타 실제 성공률", f"{scalp_stat['win_rate']}%")
+    s6.metric("판정건 평균 최고수익", f"{scalp_stat['avg_max_gain']}%")
+
+    if not scalp_stat["by_vol"].empty:
+        st.dataframe(scalp_stat["by_vol"], use_container_width=True, hide_index=True)
+
+    scalp_filter = st.radio(
+        "단타 로그 필터",
+        options=["전체", "성공", "실패", "대기중"],
+        horizontal=True,
+        key="scalp_filter_radio",
+    )
+    scalp_logs_df = load_scalp_logs(limit=200, outcome_filter=scalp_filter)
+    st.dataframe(scalp_logs_df, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# 4. 누적 AI 추천 리스트 & 성공/실패 확률 통계 (성공·실패 사유 포함)
+st.subheader("4. 누적 AI 추천 코인 리스트 & 성공/실패 통계")
+st.caption("AI 추천 검증은 **'AI 성공여부 검증'** 버튼을 누를 때 예측 시각 이후 실제 캔들을 기준으로 판정됩니다.")
+stat_bundle = get_prediction_statistics()
+
+if stat_bundle["total"] == 0:
+    st.info("아직 저장된 AI 추천 코인 리스트가 없습니다. 스캔을 실행하면 자동으로 리스트가 쌓입니다.")
+else:
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("누적 추천 건수", f"{stat_bundle['total']:,}건")
+    k2.metric("판정 완료 건수", f"{stat_bundle['settled']:,}건")
+    k3.metric("성공", f"{stat_bundle['success']:,}건")
+    k4.metric("실패", f"{stat_bundle['fail']:,}건")
+    k5.metric("실제 성공률", f"{stat_bundle['win_rate']}%")
+
+    st.markdown("#### AI 추천 성공 / 실패 상세 사유 요약")
+    reason_df = get_ai_reason_summary()
+    if not reason_df.empty:
+        st.dataframe(reason_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("아직 판정 완료된 AI 추천 건이 없습니다. 검증 버튼을 눌러 판정을 진행해 보세요.")
+
+    st.markdown("#### 목표(+3% / +5% / +10% / +20%)별 실제 달성 확률 vs AI 예측 확률")
+    target_stats_df = stat_bundle["target_stats"]
+    if not target_stats_df.empty:
+        st.dataframe(target_stats_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 저장된 AI 추천 코인 전체 리스트 & 판정 결과")
+    filter_choice = st.radio(
+        "결과 필터",
+        options=["전체", "성공", "실패", "대기중"],
+        horizontal=True,
+        key="ai_filter_radio",
+    )
+    logs_df = load_prediction_logs(limit=200, outcome_filter=filter_choice)
+    st.dataframe(logs_df, use_container_width=True, hide_index=True)
