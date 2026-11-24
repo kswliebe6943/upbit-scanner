@@ -361,7 +361,7 @@ def reset_prediction_logs():
     _run_db_write(lambda conn: conn.execute("DELETE FROM prediction_logs"))
 
 
-def get_krw_markets_by_volume(limit: int = 30) -> list:
+def get_krw_markets_by_volume(limit: int = 60) -> list:
     markets = get_krw_markets()
     if not markets:
         return []
@@ -460,25 +460,25 @@ def build_scalp_plan(
     low_price: float,
     vol_mult: float,
     ret_pct: float,
-    target_pct: float = 3.0,
+    target_pct: float = 3.5,
 ):
     span = max(high_price - low_price, 0.0)
     upper_wick_ratio = ((high_price - max(cur_price, open_price)) / span) if span > 0 else 0.0
 
-    if vol_mult >= 5.0 and ret_pct >= 4.5:
-        buy_raw = cur_price * 0.9965
-        timing = "과열 진정 후 눌림 (10~25분 내 -0.35% 부근 분할)"
-    elif upper_wick_ratio >= 0.35 or ret_pct >= 3.0:
-        buy_raw = cur_price * 0.9975
-        timing = "단기 눌림 대기 (5~20분 내 현재가 대비 -0.25% 부근)"
-    elif ret_pct >= 1.8:
-        buy_raw = cur_price * 0.9988
-        timing = "초단기 눌림 진입 (3~12분 내 현재가 대비 -0.12% 부근)"
+    if vol_mult >= 6.0 and ret_pct >= 4.5:
+        buy_raw = cur_price * 0.9970
+        timing = "초단기 숨고르기 후 진입 (3–10분 내 -0.3% 부근)"
+    elif upper_wick_ratio >= 0.35 or ret_pct >= 3.2:
+        buy_raw = cur_price * 0.9980
+        timing = "단기 눌림 확인 진입 (2–8분 내 -0.2% 부근)"
+    elif ret_pct >= 2.0:
+        buy_raw = cur_price * 0.9990
+        timing = "즉시–5분 내 눌림 진입 (-0.1% 부근)"
     else:
-        buy_raw = cur_price * 0.9996
-        timing = "즉시 진입 유효 (0~5분 내 현재가 부근)"
+        buy_raw = cur_price * 0.9997
+        timing = "즉시 진입 유효 (0–5분 내 현재가 근접)"
 
-    lower_bound = max(low_price * 0.998, cur_price * 0.994) if low_price > 0 else cur_price * 0.994
+    lower_bound = max(low_price * 0.998, cur_price * 0.995) if low_price > 0 else cur_price * 0.995
     rec_buy = format_price(max(lower_bound, min(buy_raw, cur_price)))
     rec_sell = format_price(rec_buy * (1.0 + max(0.5, float(target_pct)) / 100.0))
     if rec_sell <= rec_buy:
@@ -494,16 +494,16 @@ def _refine_ai_buy_window(row_series: pd.Series) -> str:
     if cur_p and buy_p and cur_p > 0:
         diff_pct = (buy_p - cur_p) / cur_p * 100.0
         if diff_pct >= -0.15:
-            return "즉시~10분 내 진입 (현재가 근접)"
+            return "즉시–10분 내 진입 (현재가 근접)"
         if diff_pct >= -0.5:
-            return "10~25분 내 눌림 진입 (-0.2%~-0.5%)"
+            return "10–25분 내 눌림 진입 (-0.2%–-0.5%)"
         if diff_pct >= -1.2:
-            return "25~45분 내 조정 진입 (-0.5%~-1.2%)"
-        return "45~90분 내 깊은 눌림 대기 (-1.2% 초과)"
+            return "25–45분 내 조정 진입 (-0.5%–-1.2%)"
+        return "45–90분 내 깊은 눌림 대기 (-1.2% 초과)"
 
     if raw_win and raw_win not in ("-", "None", "nan", "1~3시간", "1~3시간 내"):
         return raw_win
-    return "15~30분 내 눌림 확인 후 진입"
+    return "15–30분 내 눌림 확인 후 진입"
 
 
 def load_db_stats() -> pd.DataFrame:
@@ -677,7 +677,7 @@ def models_ready() -> bool:
 
 
 # =====================================================================
-# 업그레이드된 단타 포착(초입 수급 필터 + KST 기준) 및 30분 검증
+# 단타 포착(초입 수급 필터 + KST 기준) 및 검증
 # =====================================================================
 def _evaluate_single_spike(
     m: str,
@@ -735,7 +735,7 @@ def _evaluate_single_spike(
         and min_ret_pct <= best_ret_pct <= max_ret_pct
         and trade_val_krw >= min_trade_krw
         and upper_wick_ratio < 0.45
-        and cum_3_ret_pct <= 9.0
+        and cum_3_ret_pct <= 8.5
     ):
         return None
 
@@ -774,12 +774,12 @@ def _evaluate_single_spike(
 
 def detect_volume_spikes(
     timeframe: str = "5m",
-    min_vol_mult: float = 4.0,
-    min_ret_pct: float = 1.5,
-    max_ret_pct: float = 12.0,
+    min_vol_mult: float = 5.0,
+    min_ret_pct: float = 2.0,
+    max_ret_pct: float = 8.0,
     min_trade_krw: int = 30_000_000,
-    target_pct: float = 3.0,
-    max_coins: int = 30,
+    target_pct: float = 3.5,
+    max_coins: int = 60,
     save_to_db: bool = True,
     progress_cb=None,
 ) -> pd.DataFrame:
@@ -955,8 +955,8 @@ def _verify_single_scalp(
 
 
 def verify_scalp_predictions(
-    expire_hours: float = 0.5,
-    stop_loss_pct: float = 1.5,
+    expire_hours: float = 0.25,
+    stop_loss_pct: float = 2.0,
     progress_cb=None,
 ) -> pd.DataFrame:
     ensure_scalp_table()
@@ -1063,8 +1063,8 @@ def get_scalp_statistics() -> dict:
 
     vol_rows = []
     buckets = [
-        ("2.5배 ~ 3.5배", 2.5, 3.5),
-        ("3.5배 ~ 5.0배", 3.5, 5.0),
+        ("2.5배 – 3.5배", 2.5, 3.5),
+        ("3.5배 – 5.0배", 3.5, 5.0),
         ("5.0배 이상", 5.0, 999.0),
     ]
     for label, lo, hi in buckets:
@@ -1153,7 +1153,7 @@ def load_scalp_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.Data
     )
     return reorder_columns_front(
         formatted,
-        ["포착시각", "코인", "추천매수금액", "추천매도금액", "거래량배율(배)", "상승률(%)", "매수여부", "결과", "추천매수타이밍"],
+        ["포착시각", "코인", "추천매수금액", "추천매도금액", "거래량배율(배)", "상승률(%)", "최고수익(%)", "매수여부", "결과", "상세상태"],
     )
 
 
@@ -1167,10 +1167,89 @@ def _make_ui_progress_cb(bar, caption_box):
 
 
 # =====================================================================
-# 화면 구성 (폰 단타 중심 레이아웃)
+# 추천 단타 세팅 프리셋 정의(총 6종) 및 즉시 반영 콜백
+# =====================================================================
+SCALP_PRESETS = {
+    "추천1. 5분 초단타 셋팅": {
+        "spike_tf": "5m",
+        "min_vol_mult": 5.0,
+        "min_ret_pct": 2.0,
+        "target_pct": 3.5,
+        "stop_loss_pct": 2.0,
+        "verify_minutes": 15,
+        "max_coins": 60,
+    },
+    "추천2. 15분 단타 셋팅": {
+        "spike_tf": "5m",
+        "min_vol_mult": 3.5,
+        "min_ret_pct": 1.5,
+        "target_pct": 3.0,
+        "stop_loss_pct": 2.0,
+        "verify_minutes": 30,
+        "max_coins": 80,
+    },
+    "추천3. 초입 저점 근사치 셋팅": {
+        "spike_tf": "5m",
+        "min_vol_mult": 4.0,
+        "min_ret_pct": 1.0,
+        "target_pct": 3.5,
+        "stop_loss_pct": 2.2,
+        "verify_minutes": 20,
+        "max_coins": 120,
+    },
+    "추천4. 폭발 수급 슈팅형": {
+        "spike_tf": "5m",
+        "min_vol_mult": 7.0,
+        "min_ret_pct": 2.5,
+        "target_pct": 4.0,
+        "stop_loss_pct": 2.0,
+        "verify_minutes": 15,
+        "max_coins": 60,
+    },
+    "추천5. 칼손절 초단타형": {
+        "spike_tf": "5m",
+        "min_vol_mult": 5.0,
+        "min_ret_pct": 2.0,
+        "target_pct": 3.0,
+        "stop_loss_pct": 1.5,
+        "verify_minutes": 10,
+        "max_coins": 50,
+    },
+    "추천6. 15분봉 추세 확인형": {
+        "spike_tf": "15m",
+        "min_vol_mult": 3.5,
+        "min_ret_pct": 2.0,
+        "target_pct": 3.5,
+        "stop_loss_pct": 2.0,
+        "verify_minutes": 30,
+        "max_coins": 80,
+    },
+}
+
+_DEFAULT_PRESET_NAME = "추천1. 5분 초단타 셋팅"
+_DEFAULT_PRESET_VALS = SCALP_PRESETS[_DEFAULT_PRESET_NAME]
+
+if "scalp_preset_select" not in st.session_state:
+    st.session_state["scalp_preset_select"] = _DEFAULT_PRESET_NAME
+for _k, _v in _DEFAULT_PRESET_VALS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+def _apply_selected_scalp_preset():
+    chosen = st.session_state.get("scalp_preset_select")
+    cfg = SCALP_PRESETS.get(chosen)
+    if not cfg:
+        return
+    for k, v in cfg.items():
+        st.session_state[k] = v
+
+
+# =====================================================================
+# 화면 구성 (5–15분 초단타 중심 레이아웃)
 # =====================================================================
 st.title("⚡ 업비트 단타 & AI 스캐너")
-st.caption(f"KST 기준 ({now_kst_str('%H:%M:%S')}) · 단타 초입 수급 포착 + LightGBM AI 스캐너")
+st.caption(f"KST 기준 ({now_kst_str('%H:%M:%S')}) · 5–15분 초단타 수급 포착 + LightGBM AI 스캐너")
 
 if "reset_nonce" not in st.session_state:
     st.session_state["reset_nonce"] = 0
@@ -1270,19 +1349,28 @@ with st.sidebar:
         st.rerun()
 
 # =====================================================================
-# 1. [상단 메인] 실시간 단타 포착
+# 1. [상단 메인] 실시간 단타 포착 (추천 셋팅 선택 시 슬라이더 즉시 연동)
 # =====================================================================
-st.subheader("1. 실시간 단타 포착 (초입 수급 · 추천 매수/매도가)")
+st.subheader("1. 실시간 단타 포착 (5–15분 내 +3–5% 초단타 세팅)")
+
+st.selectbox(
+    "추천 단타 세팅 선택 (선택 즉시 슬라이더 반영)",
+    options=list(SCALP_PRESETS.keys()),
+    key="scalp_preset_select",
+    on_change=_apply_selected_scalp_preset,
+)
 
 r1_c1, r1_c2, r1_c3 = st.columns(3)
-spike_tf = r1_c1.selectbox("감지 봉", options=["5m", "15m"], index=0)
-min_vol_mult = r1_c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, value=4.0, step=0.5)
-min_ret_pct = r1_c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, value=1.5, step=0.5)
+spike_tf = r1_c1.selectbox("감지 봉", options=["5m", "15m"], key="spike_tf")
+min_vol_mult = r1_c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, step=0.5, key="min_vol_mult")
+min_ret_pct = r1_c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, step=0.5, key="min_ret_pct")
 
 r2_c1, r2_c2, r2_c3 = st.columns(3)
-target_pct = r2_c1.slider("목표수익 (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
-stop_loss_pct = r2_c2.slider("손절 기준 (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
-max_coins = r2_c3.slider("상위 탐색 수", min_value=10, max_value=296, value=50, step=10)
+target_pct = r2_c1.slider("목표수익 (%)", min_value=1.0, max_value=10.0, step=0.5, key="target_pct")
+stop_loss_pct = r2_c2.slider("손절 기준 (%)", min_value=0.5, max_value=5.0, step=0.5, key="stop_loss_pct")
+verify_minutes = r2_c3.slider("검증 시간 (분)", min_value=10, max_value=60, step=5, key="verify_minutes")
+
+max_coins = st.slider("거래대금 상위 탐색 수", min_value=10, max_value=296, step=10, key="max_coins")
 
 b_col1, b_col2 = st.columns([2, 1])
 with b_col1:
@@ -1295,7 +1383,7 @@ with b_col1:
                 timeframe=spike_tf,
                 min_vol_mult=min_vol_mult,
                 min_ret_pct=min_ret_pct,
-                max_ret_pct=12.0,
+                max_ret_pct=8.0,
                 min_trade_krw=30_000_000,
                 target_pct=target_pct,
                 max_coins=max_coins,
@@ -1309,12 +1397,16 @@ with b_col1:
             st.error(f"❌ 단타 포착 오류: {type(exc).__name__}: {exc}")
 
 with b_col2:
-    if st.button("✅ 단타 검증 (30분)", use_container_width=True):
+    if st.button(f"✅ 단타 검증 ({verify_minutes}분)", use_container_width=True):
         v_bar = st.progress(0.05)
         v_cap = st.empty()
         v_cb = _make_ui_progress_cb(v_bar, v_cap)
         try:
-            verify_scalp_predictions(expire_hours=0.5, stop_loss_pct=stop_loss_pct, progress_cb=v_cb)
+            verify_scalp_predictions(
+                expire_hours=verify_minutes / 60.0,
+                stop_loss_pct=stop_loss_pct,
+                progress_cb=v_cb,
+            )
             v_bar.progress(1.0)
             v_cap.caption("✅ 단타 검증 완료 (100%)")
             st.rerun()
@@ -1335,14 +1427,14 @@ if isinstance(spike_df, pd.DataFrame) and not spike_df.empty:
     )
     st.dataframe(formatted_spike, use_container_width=True, hide_index=True)
 elif isinstance(spike_df, pd.DataFrame) and spike_df.empty:
-    st.info("현재 조건에 맞는 단타 종목이 없습니다. 거래량 배율이나 최소 상승률을 낮추거나 탐색 수를 늘려보세요.")
+    st.info("현재 조건에 맞는 단타 종목이 없습니다. 거래량 배율이나 최소 상승률을 낮춰 다시 눌러보세요.")
 
 st.divider()
 
 # =====================================================================
 # 2. 단타 성공/실패 통계 및 포착 로그
 # =====================================================================
-st.subheader("2. 단타 포착 통계 & 로그 (30분·손절 기준)")
+st.subheader("2. 단타 포착 통계 & 로그")
 scalp_stat = get_scalp_statistics()
 if scalp_stat["total"] == 0:
     st.caption("아직 저장된 단타 포착 로그가 없습니다. **'지금 단타 종목 포착하기'**를 누르면 기록됩니다.")
