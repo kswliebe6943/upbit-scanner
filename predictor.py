@@ -112,6 +112,40 @@ def _exec_write(sql_or_fn, params=(), max_retries: int = 8):
         raise last_exc
 
 
+def _ensure_prediction_logs_table(conn: sqlite3.Connection):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            predicted_at TEXT NOT NULL,
+            market TEXT NOT NULL,
+            trade_style TEXT DEFAULT '단타',
+            current_price REAL NOT NULL,
+            rec_buy_price REAL NOT NULL,
+            stop_loss REAL NOT NULL,
+            target_3 REAL NOT NULL,
+            target_5 REAL NOT NULL,
+            target_10 REAL NOT NULL,
+            target_20 REAL NOT NULL,
+            prob_3 REAL DEFAULT 0.0,
+            prob_5 REAL DEFAULT 0.0,
+            prob_10 REAL DEFAULT 0.0,
+            prob_20 REAL DEFAULT 0.0,
+            expected_buy_window TEXT,
+            status TEXT DEFAULT 'PENDING',
+            outcome TEXT DEFAULT 'PENDING',
+            max_gain_pct REAL DEFAULT 0.0,
+            hit_3 INTEGER DEFAULT 0,
+            hit_5 INTEGER DEFAULT 0,
+            hit_10 INTEGER DEFAULT 0,
+            hit_20 INTEGER DEFAULT 0,
+            verified_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
 def ensure_log_columns():
     """기존 prediction_logs 테이블에 통계/대응유형 컬럼이 없으면 안전하게 추가"""
     try:
@@ -120,13 +154,8 @@ def ensure_log_columns():
         print(f"[WARN] init_db skipped in ensure_log_columns: {exc}")
 
     def _alter(conn):
+        _ensure_prediction_logs_table(conn)
         cur = conn.cursor()
-        tbl = cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='prediction_logs'"
-        ).fetchone()
-        if not tbl:
-            return
-
         cur.execute("PRAGMA table_info(prediction_logs)")
         existing_cols = {row[1] for row in cur.fetchall()}
 
@@ -1259,15 +1288,28 @@ def verify_predictions(use_1m_recent: bool = True, success_target_pct: int = 3) 
 
 
 def get_prediction_statistics() -> dict:
-    ensure_log_columns()
-    conn = _connect_db(timeout=30.0)
+    empty_res = {
+        "total": 0,
+        "settled": 0,
+        "success": 0,
+        "fail": 0,
+        "win_rate": 0.0,
+        "target_stats": pd.DataFrame(),
+    }
     try:
-        df = pd.read_sql_query("SELECT * FROM prediction_logs ORDER BY id DESC", conn)
-    finally:
-        conn.close()
+        ensure_log_columns()
+        conn = _connect_db(timeout=30.0)
+        try:
+            _ensure_prediction_logs_table(conn)
+            df = pd.read_sql_query("SELECT * FROM prediction_logs ORDER BY id DESC", conn)
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[WARN] get_prediction_statistics fallback: {exc}")
+        return empty_res
 
     if df.empty:
-        return {"total": 0, "settled": 0, "success": 0, "fail": 0, "win_rate": 0.0, "target_stats": pd.DataFrame()}
+        return empty_res
 
     settled_df = df[df["outcome"].isin(["SUCCESS", "FAIL"])]
     bought_df = df[df["status"].isin(["BOUGHT", "HIT_3", "HIT_5", "HIT_10", "HIT_20", "STOPPED", "EXPIRED"])]
@@ -1283,9 +1325,9 @@ def get_prediction_statistics() -> dict:
     for pct in TARGETS:
         hit_col = f"hit_{pct}"
         prob_col = f"prob_{pct}"
-        actual_hits = int(bought_df[hit_col].sum()) if len(bought_df) > 0 else 0
+        actual_hits = int(bought_df[hit_col].sum()) if (len(bought_df) > 0 and hit_col in bought_df.columns) else 0
         actual_rate = round((actual_hits / denom * 100.0), 1) if denom > 0 else 0.0
-        avg_pred_prob = round(float(df[prob_col].mean()), 1) if len(df) > 0 else 0.0
+        avg_pred_prob = round(float(df[prob_col].mean()), 1) if (len(df) > 0 and prob_col in df.columns) else 0.0
         target_rows.append({
             "목표": f"+{pct}%",
             "체결/검증모수": denom,
