@@ -98,15 +98,15 @@ def _run_db_write(fn, max_retries: int = 8):
 def safe_init_db():
     try:
         _run_db_write(lambda _conn: init_db())
-    except Exception:
-        init_db()
+    except Exception as exc:
+        print(f"[WARN] safe_init_db skipped: {exc}")
 
 
 def safe_ensure_log_columns():
     try:
         _run_db_write(lambda _conn: ensure_log_columns())
-    except Exception:
-        ensure_log_columns()
+    except Exception as exc:
+        print(f"[WARN] safe_ensure_log_columns skipped: {exc}")
 
 
 safe_init_db()
@@ -395,7 +395,10 @@ def ensure_scalp_table():
         if "verify_minutes" not in cols:
             cur.execute("ALTER TABLE scalp_logs ADD COLUMN verify_minutes INTEGER NOT NULL DEFAULT 15")
 
-    _run_db_write(_create)
+    try:
+        _run_db_write(_create)
+    except Exception as exc:
+        print(f"[WARN] ensure_scalp_table skipped: {exc}")
 
 
 ensure_scalp_table()

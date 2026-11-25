@@ -114,10 +114,19 @@ def _exec_write(sql_or_fn, params=(), max_retries: int = 8):
 
 def ensure_log_columns():
     """기존 prediction_logs 테이블에 통계/대응유형 컬럼이 없으면 안전하게 추가"""
-    init_db()
+    try:
+        init_db()
+    except Exception as exc:
+        print(f"[WARN] init_db skipped in ensure_log_columns: {exc}")
 
     def _alter(conn):
         cur = conn.cursor()
+        tbl = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='prediction_logs'"
+        ).fetchone()
+        if not tbl:
+            return
+
         cur.execute("PRAGMA table_info(prediction_logs)")
         existing_cols = {row[1] for row in cur.fetchall()}
 
@@ -132,9 +141,15 @@ def ensure_log_columns():
         ]
         for col_name, col_def in alter_stmts:
             if col_name not in existing_cols:
-                cur.execute(f"ALTER TABLE prediction_logs ADD COLUMN {col_name} {col_def}")
+                try:
+                    cur.execute(f"ALTER TABLE prediction_logs ADD COLUMN {col_name} {col_def}")
+                except sqlite3.OperationalError as col_exc:
+                    print(f"[WARN] skip ALTER COLUMN {col_name}: {col_exc}")
 
-    _exec_write(_alter)
+    try:
+        _exec_write(_alter)
+    except Exception as exc:
+        print(f"[WARN] ensure_log_columns skipped: {exc}")
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
