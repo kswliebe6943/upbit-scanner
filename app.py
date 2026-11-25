@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import inspect
 import sqlite3
+import db_logs
 import statistics
 import subprocess
 import sys
@@ -397,6 +398,7 @@ def ensure_scalp_table():
 
     try:
         _run_db_write(_create)
+        db_logs.ensure_log_tables(DB_PATH)
     except Exception as exc:
         print(f"[WARN] ensure_scalp_table skipped: {exc}")
 
@@ -406,12 +408,12 @@ ensure_scalp_table()
 
 def reset_scalp_logs():
     ensure_scalp_table()
-    _run_db_write(lambda conn: conn.execute("DELETE FROM scalp_logs"))
+    db_logs.execute_log_sql("DELETE FROM scalp_logs", sqlite_path=DB_PATH)
 
 
 def reset_prediction_logs():
     safe_ensure_log_columns()
-    _run_db_write(lambda conn: conn.execute("DELETE FROM prediction_logs"))
+    db_logs.execute_log_sql("DELETE FROM prediction_logs", sqlite_path=DB_PATH)
 
 
 def get_krw_markets_by_volume(limit: int = 60) -> list:
@@ -672,11 +674,7 @@ def _classify_ai_reason(row) -> str:
 
 def get_ai_reason_summary() -> pd.DataFrame:
     safe_ensure_log_columns()
-    conn = get_db_connection(timeout=30.0)
-    try:
-        df = pd.read_sql_query("SELECT * FROM prediction_logs ORDER BY id DESC", conn)
-    finally:
-        conn.close()
+    df = db_logs.read_log_df("SELECT * FROM prediction_logs ORDER BY id DESC", sqlite_path=DB_PATH)
 
     if df.empty:
         return pd.DataFrame()
@@ -700,7 +698,7 @@ def get_ai_reason_summary() -> pd.DataFrame:
 
 
 def load_prediction_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.DataFrame:
-    conn = get_db_connection(timeout=30.0)
+    safe_ensure_log_columns()
     try:
         base_sql = """
             SELECT
@@ -712,56 +710,19 @@ def load_prediction_logs(limit: int = 200, outcome_filter: str = "전체") -> pd
         """
         code_map = {"성공": "SUCCESS", "실패": "FAIL", "대기중": "PENDING"}
         if outcome_filter in code_map:
-            df = pd.read_sql_query(
+            return db_logs.read_log_df(
                 base_sql + " WHERE outcome = ? ORDER BY id DESC LIMIT ?",
-                conn,
-                params=(code_map[outcome_filter], limit),
+                params=(code_map[outcome_filter], int(limit)),
+                sqlite_path=DB_PATH,
             )
-        else:
-            df = pd.read_sql_query(
-                base_sql + " ORDER BY id DESC LIMIT ?",
-                conn,
-                params=(limit,),
-            )
-    finally:
-        conn.close()
-
-    if df.empty:
-        return df
-
-    df["판정사유"] = df.apply(_classify_ai_reason, axis=1)
-    df["expected_buy_window"] = df.apply(_refine_ai_buy_window, axis=1)
-    df["status"] = df["status"].apply(_translate_status)
-    df["outcome"] = df["outcome"].apply(_translate_outcome)
-
-    renamed = df.rename(columns={
-        "id": "번호",
-        "predicted_at": "예측(포착)시각",
-        "market": "코인",
-        "current_price": "포착시점현재가",
-        "rec_buy_price": "추천매수가",
-        "stop_loss": "손절가",
-        "target_3": "목표+3%",
-        "target_5": "목표+5%",
-        "target_10": "목표+10%",
-        "target_20": "목표+20%",
-        "prob_3": "+3%확률(%)",
-        "prob_5": "+5%확률(%)",
-        "prob_10": "+10%확률(%)",
-        "prob_20": "+20%확률(%)",
-        "max_gain_pct": "최고수익(%)",
-        "status": "진행상태",
-        "outcome": "결과",
-        "expected_buy_window": "예상매수시점",
-        "verified_at": "검증시각",
-    })
-    renamed = attach_korean_coin_names(renamed, col_name="코인")
-    return format_price_columns(
-        renamed,
-        price_cols=["포착시점현재가", "추천매수가", "손절가", "목표+3%", "목표+5%", "목표+10%", "목표+20%"],
-        int_cols=["번호"],
-    )
-
+        return db_logs.read_log_df(
+            base_sql + " ORDER BY id DESC LIMIT ?",
+            params=(int(limit),),
+            sqlite_path=DB_PATH,
+        )
+    except Exception as exc:
+        print(f"[WARN] load_prediction_logs failed: {exc}")
+        return pd.DataFrame()
 
 def models_ready() -> bool:
     return all((MODEL_DIR / f"lgb_target_{pct}.txt").exists() for pct in TARGETS)
@@ -933,20 +894,18 @@ def detect_volume_spikes(
         if progress_cb:
             progress_cb(0.90, "단타 포착 로그 DB 저장 중")
 
-        def _insert_scalp(conn):
-            conn.executemany(
-                """
-                INSERT INTO scalp_logs (
-                    detected_at, preset_name, market, timeframe, current_price,
-                    rec_buy_price, rec_sell_price, target_pct, stop_loss_pct, verify_minutes, timing,
-                    ret_pct, vol_mult, trade_val_krw,
-                    bought, max_gain_pct, outcome, status_detail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0.0, 'PENDING', '대기중')
-                """,
-                db_rows,
-            )
-
-        _run_db_write(_insert_scalp)
+        db_logs.executemany_log_sql(
+            """
+            INSERT INTO scalp_logs (
+                detected_at, preset_name, market, timeframe, current_price,
+                rec_buy_price, rec_sell_price, target_pct, stop_loss_pct, verify_minutes, timing,
+                ret_pct, vol_mult, trade_val_krw,
+                bought, max_gain_pct, outcome, status_detail
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0.0, 'PENDING', '대기중')
+            """,
+            db_rows,
+            sqlite_path=DB_PATH,
+        )
 
     if progress_cb:
         progress_cb(1.0, "단타 포착 완료")
@@ -1077,18 +1036,14 @@ def verify_scalp_predictions(
     ensure_scalp_table()
     if progress_cb:
         progress_cb(0.10, "단타 대기 로그 조회 중")
-    conn = get_db_connection(timeout=30.0)
-    try:
-        logs = pd.read_sql_query(
-            """
-            SELECT * FROM scalp_logs
-            WHERE outcome = 'PENDING'
-            ORDER BY id ASC
-            """,
-            conn,
-        )
-    finally:
-        conn.close()
+    logs = db_logs.read_log_df(
+        """
+        SELECT * FROM scalp_logs
+        WHERE outcome = 'PENDING'
+        ORDER BY id ASC
+        """,
+        sqlite_path=DB_PATH,
+    )
 
     if logs.empty:
         if progress_cb:
@@ -1123,26 +1078,20 @@ def verify_scalp_predictions(
                 updates.append((bought, max_gain_pct, outcome, status_detail, kst_now_str, row_id))
 
     if updates:
-        def _apply_updates(conn):
-            conn.executemany(
-                """
-                UPDATE scalp_logs
-                SET bought = ?, max_gain_pct = ?, outcome = ?, status_detail = ?, verified_at = ?
-                WHERE id = ?
-                """,
-                updates,
-            )
-
-        _run_db_write(_apply_updates)
-
-    conn = get_db_connection(timeout=30.0)
-    try:
-        summary = pd.read_sql_query(
-            "SELECT outcome, COUNT(*) AS cnt FROM scalp_logs GROUP BY outcome",
-            conn,
+        db_logs.executemany_log_sql(
+            """
+            UPDATE scalp_logs
+            SET bought = ?, max_gain_pct = ?, outcome = ?, status_detail = ?, verified_at = ?
+            WHERE id = ?
+            """,
+            updates,
+            sqlite_path=DB_PATH,
         )
-    finally:
-        conn.close()
+
+    summary = db_logs.read_log_df(
+        "SELECT outcome, COUNT(*) AS cnt FROM scalp_logs GROUP BY outcome",
+        sqlite_path=DB_PATH,
+    )
 
     if progress_cb:
         progress_cb(1.0, f"단타 검증 완료 ({len(updates)}건 갱신)")
@@ -1151,11 +1100,7 @@ def verify_scalp_predictions(
 
 def get_scalp_statistics() -> dict:
     ensure_scalp_table()
-    conn = get_db_connection(timeout=30.0)
-    try:
-        df = pd.read_sql_query("SELECT * FROM scalp_logs ORDER BY id DESC", conn)
-    finally:
-        conn.close()
+    df = db_logs.read_log_df("SELECT * FROM scalp_logs ORDER BY id DESC", sqlite_path=DB_PATH)
 
     if df.empty:
         return {
@@ -1240,7 +1185,6 @@ def load_scalp_logs(
     preset_filter: str = "전체",
 ) -> pd.DataFrame:
     ensure_scalp_table()
-    conn = get_db_connection(timeout=30.0)
     try:
         base_sql = """
             SELECT
@@ -1260,72 +1204,15 @@ def load_scalp_logs(
             conditions.append("preset_name = ?")
             params.append(preset_filter)
 
-        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        params.append(limit)
-        df = pd.read_sql_query(
-            base_sql + where_clause + " ORDER BY id DESC LIMIT ?",
-            conn,
-            params=tuple(params),
-        )
-    finally:
-        conn.close()
+        if conditions:
+            base_sql += " WHERE " + " AND ".join(conditions)
+        base_sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
 
-    if df.empty:
-        return df
-
-    df["preset_name"] = df["preset_name"].fillna("커스텀").replace({"": "커스텀"})
-    df["verify_minutes"] = df["verify_minutes"].fillna(15).astype(int)
-    df["stop_loss_pct"] = df["stop_loss_pct"].fillna(2.0).astype(float).round(1)
-    df["bought"] = df["bought"].apply(lambda x: "체결됨" if int(x or 0) == 1 else "미체결")
-    df["outcome"] = df["outcome"].apply(_translate_outcome)
-    df["status_detail"] = df["status_detail"].replace({"PENDING": "대기중"})
-
-    renamed = df.rename(columns={
-        "id": "번호",
-        "detected_at": "포착시각",
-        "preset_name": "세팅(프리셋)",
-        "verify_minutes": "검증기준(분)",
-        "stop_loss_pct": "손절기준(%)",
-        "market": "코인",
-        "timeframe": "봉",
-        "current_price": "포착시점현재가",
-        "rec_buy_price": "추천매수금액",
-        "rec_sell_price": "추천매도금액",
-        "target_pct": "목표(%)",
-        "timing": "추천매수타이밍",
-        "ret_pct": "상승률(%)",
-        "vol_mult": "거래량배율(배)",
-        "bought": "매수여부",
-        "max_gain_pct": "최고수익(%)",
-        "outcome": "결과",
-        "status_detail": "상세상태",
-        "verified_at": "검증시각",
-    })
-    renamed = attach_korean_coin_names(renamed, col_name="코인")
-    formatted = format_price_columns(
-        renamed,
-        price_cols=["포착시점현재가", "추천매수금액", "추천매도금액"],
-        int_cols=["번호", "검증기준(분)"],
-    )
-    return reorder_columns_front(
-        formatted,
-        [
-            "포착시각",
-            "세팅(프리셋)",
-            "검증기준(분)",
-            "손절기준(%)",
-            "코인",
-            "추천매수금액",
-            "추천매도금액",
-            "거래량배율(배)",
-            "상승률(%)",
-            "최고수익(%)",
-            "매수여부",
-            "결과",
-            "상세상태",
-        ],
-    )
-
+        return db_logs.read_log_df(base_sql, params=params, sqlite_path=DB_PATH)
+    except Exception as exc:
+        print(f"[WARN] load_scalp_logs failed: {exc}")
+        return pd.DataFrame()
 
 def _make_ui_progress_cb(bar, caption_box):
     def _cb(ratio: float, msg: str = ""):

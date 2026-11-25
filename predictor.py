@@ -1,4 +1,5 @@
 import sqlite3
+import db_logs
 import time
 import warnings
 from bisect import bisect_right
@@ -112,71 +113,14 @@ def _exec_write(sql_or_fn, params=(), max_retries: int = 8):
         raise last_exc
 
 
-def _ensure_prediction_logs_table(conn: sqlite3.Connection):
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS prediction_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            predicted_at TEXT NOT NULL,
-            market TEXT NOT NULL,
-            trade_style TEXT DEFAULT '단타',
-            current_price REAL NOT NULL,
-            rec_buy_price REAL NOT NULL,
-            stop_loss REAL NOT NULL,
-            target_3 REAL NOT NULL,
-            target_5 REAL NOT NULL,
-            target_10 REAL NOT NULL,
-            target_20 REAL NOT NULL,
-            prob_3 REAL DEFAULT 0.0,
-            prob_5 REAL DEFAULT 0.0,
-            prob_10 REAL DEFAULT 0.0,
-            prob_20 REAL DEFAULT 0.0,
-            expected_buy_window TEXT,
-            status TEXT DEFAULT 'PENDING',
-            outcome TEXT DEFAULT 'PENDING',
-            max_gain_pct REAL DEFAULT 0.0,
-            hit_3 INTEGER DEFAULT 0,
-            hit_5 INTEGER DEFAULT 0,
-            hit_10 INTEGER DEFAULT 0,
-            hit_20 INTEGER DEFAULT 0,
-            verified_at TEXT
-        )
-        """
-    )
-    conn.commit()
+def _ensure_prediction_logs_table(conn=None):
+    db_logs.ensure_log_tables(DB_PATH)
 
 
 def ensure_log_columns():
-    """기존 prediction_logs 테이블에 통계/대응유형 컬럼이 없으면 안전하게 추가"""
+    """prediction_logs 테이블 준비 (로컬 + 공용 PG)"""
     try:
-        init_db()
-    except Exception as exc:
-        print(f"[WARN] init_db skipped in ensure_log_columns: {exc}")
-
-    def _alter(conn):
-        _ensure_prediction_logs_table(conn)
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(prediction_logs)")
-        existing_cols = {row[1] for row in cur.fetchall()}
-
-        alter_stmts = [
-            ("max_gain_pct", "REAL DEFAULT 0.0"),
-            ("hit_3", "INTEGER DEFAULT 0"),
-            ("hit_5", "INTEGER DEFAULT 0"),
-            ("hit_10", "INTEGER DEFAULT 0"),
-            ("hit_20", "INTEGER DEFAULT 0"),
-            ("outcome", "TEXT DEFAULT 'PENDING'"),   # PENDING / SUCCESS / FAIL
-            ("trade_style", "TEXT DEFAULT '단타'"),  # 단타 / 스윙 / 안정스윙 / 중기추세
-        ]
-        for col_name, col_def in alter_stmts:
-            if col_name not in existing_cols:
-                try:
-                    cur.execute(f"ALTER TABLE prediction_logs ADD COLUMN {col_name} {col_def}")
-                except sqlite3.OperationalError as col_exc:
-                    print(f"[WARN] skip ALTER COLUMN {col_name}: {col_exc}")
-
-    try:
-        _exec_write(_alter)
+        db_logs.ensure_log_tables(DB_PATH)
     except Exception as exc:
         print(f"[WARN] ensure_log_columns skipped: {exc}")
 
@@ -953,7 +897,7 @@ def scan_market(top_n: int = 10, min_prob_3: float = 0.55, save_to_db: bool = Tr
         results.append(row_out)
 
         if save_to_db:
-            _exec_write(
+            db_logs.execute_log_sql(
                 """
                 INSERT INTO prediction_logs (
                     predicted_at, market, trade_style, current_price, rec_buy_price, stop_loss,
@@ -968,6 +912,7 @@ def scan_market(top_n: int = 10, min_prob_3: float = 0.55, save_to_db: bool = Tr
                     item["prob_3"], item["prob_5"], item["prob_10"], item["prob_20"],
                     buy_window,
                 ),
+                sqlite_path=DB_PATH,
             )
 
         time.sleep(0.1)
@@ -1123,7 +1068,7 @@ def scan_swing_tracks(
             grouped_results[track_key].append(row_out)
 
             if save_to_db:
-                _exec_write(
+                db_logs.execute_log_sql(
                     """
                     INSERT INTO prediction_logs (
                         predicted_at, market, trade_style, current_price, rec_buy_price, stop_loss,
@@ -1138,6 +1083,7 @@ def scan_swing_tracks(
                         item["prob_3"], item["prob_5"], item["prob_10"], item["prob_20"],
                         buy_window,
                     ),
+                    sqlite_path=DB_PATH,
                 )
             time.sleep(0.08)
 
@@ -1149,19 +1095,15 @@ def scan_swing_tracks(
 
 def verify_predictions(use_1m_recent: bool = True, success_target_pct: int = 3) -> pd.DataFrame:
     ensure_log_columns()
-    conn = _connect_db(timeout=30.0)
-    try:
-        logs = pd.read_sql_query(
-            """
-            SELECT * FROM prediction_logs
-            WHERE outcome = 'PENDING'
-               OR (outcome = 'SUCCESS' AND status NOT IN ('HIT_20'))
-            ORDER BY id ASC
-            """,
-            conn,
-        )
-    finally:
-        conn.close()
+    logs = db_logs.read_log_df(
+        """
+        SELECT * FROM prediction_logs
+        WHERE outcome = 'PENDING'
+           OR (outcome = 'SUCCESS' AND status NOT IN ('HIT_20'))
+        ORDER BY id ASC
+        """,
+        sqlite_path=DB_PATH,
+    )
 
     if logs.empty:
         return pd.DataFrame()
@@ -1258,30 +1200,25 @@ def verify_predictions(use_1m_recent: bool = True, success_target_pct: int = 3) 
             )
 
     if updates:
-        _exec_write(
-            lambda c: c.executemany(
-                """
-                UPDATE prediction_logs
-                SET status = ?, outcome = ?, max_gain_pct = ?,
-                    hit_3 = ?, hit_5 = ?, hit_10 = ?, hit_20 = ?, verified_at = ?
-                WHERE id = ?
-                """,
-                updates,
-            )
+        db_logs.executemany_log_sql(
+            """
+            UPDATE prediction_logs
+            SET status = ?, outcome = ?, max_gain_pct = ?,
+                hit_3 = ?, hit_5 = ?, hit_10 = ?, hit_20 = ?, verified_at = ?
+            WHERE id = ?
+            """,
+            updates,
+            sqlite_path=DB_PATH,
         )
 
-    conn = _connect_db(timeout=30.0)
-    try:
-        summary = pd.read_sql_query(
-            """
-            SELECT outcome, status, COUNT(*) as cnt
-            FROM prediction_logs
-            GROUP BY outcome, status
-            """,
-            conn,
-        )
-    finally:
-        conn.close()
+    summary = db_logs.read_log_df(
+        """
+        SELECT outcome, status, COUNT(*) as cnt
+        FROM prediction_logs
+        GROUP BY outcome, status
+        """,
+        sqlite_path=DB_PATH,
+    )
 
     print(f"[{now_str}] 검증 완료: {len(updates)}건 상태 업데이트됨")
     return summary
@@ -1298,12 +1235,8 @@ def get_prediction_statistics() -> dict:
     }
     try:
         ensure_log_columns()
-        conn = _connect_db(timeout=30.0)
-        try:
-            _ensure_prediction_logs_table(conn)
-            df = pd.read_sql_query("SELECT * FROM prediction_logs ORDER BY id DESC", conn)
-        finally:
-            conn.close()
+        _ensure_prediction_logs_table()
+        df = db_logs.read_log_df("SELECT * FROM prediction_logs ORDER BY id DESC", sqlite_path=DB_PATH)
     except Exception as exc:
         print(f"[WARN] get_prediction_statistics fallback: {exc}")
         return empty_res
