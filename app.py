@@ -26,7 +26,7 @@ from predictor import (
     TARGETS,
     ensure_log_columns,
     get_prediction_statistics,
-    scan_market,
+    scan_market_with_watchlist,
     train_models,
     verify_predictions,
 )
@@ -151,10 +151,14 @@ def _call_with_optional_progress(fn, *args, progress_cb=None, **kwargs):
 
 
 def _get_default_target_count(timeframe: str) -> int:
+    tf_targets = getattr(upbit_collector, "TIMEFRAME_TARGETS", None)
+    if isinstance(tf_targets, dict) and isinstance(tf_targets.get(timeframe), int) and tf_targets[timeframe] > 0:
+        return tf_targets[timeframe]
+
     const_map = {
         "1d": ("TARGET_1D", "DAYS_COUNT", "DEFAULT_1D_COUNT", 365),
-        "240m": ("TARGET_240M", "HOURS_4_COUNT", "DEFAULT_240M_COUNT", 500),
-        "60m": ("TARGET_60M", "HOURS_1_COUNT", "DEFAULT_60M_COUNT", 500),
+        "240m": ("TARGET_240M", "HOURS_4_COUNT", "DEFAULT_240M_COUNT", 2190),
+        "60m": ("TARGET_60M", "HOURS_1_COUNT", "DEFAULT_60M_COUNT", 8760),
     }
     for attr_name in const_map.get(timeframe, ())[:-1]:
         val = getattr(upbit_collector, attr_name, None)
@@ -163,28 +167,46 @@ def _get_default_target_count(timeframe: str) -> int:
     return const_map.get(timeframe, (None, None, None, 365))[-1]
 
 
-def run_collector_direct(progress_cb=None):
+def run_collector_direct(progress_cb=None, stop_check=None, force: bool = False):
+    def _stopped() -> bool:
+        return bool(stop_check and stop_check())
+
+    if _stopped():
+        return
+
     if progress_cb:
         progress_cb(0.05, "최신 캔들 수집 준비 중")
 
     collect_fn = getattr(upbit_collector, "collect_timeframe_for_all", None)
     if callable(collect_fn):
+        sig = inspect.signature(collect_fn)
         tf_plan = [
             ("1d", _get_default_target_count("1d"), 0.10, 0.40),
             ("240m", _get_default_target_count("240m"), 0.40, 0.72),
             ("60m", _get_default_target_count("60m"), 0.72, 0.98),
         ]
         for tf, cnt, start_r, end_r in tf_plan:
+            if _stopped():
+                break
             if progress_cb:
                 progress_cb(start_r, f"[{tf}] 캔들 수집 중 (목표 {cnt}개)")
-            _call_with_optional_progress(collect_fn, tf, cnt, progress_cb=progress_cb)
+            kw = {}
+            if "force" in sig.parameters:
+                kw["force"] = force
+            if "stop_check" in sig.parameters:
+                kw["stop_check"] = stop_check
+            _call_with_optional_progress(collect_fn, tf, cnt, progress_cb=progress_cb, **kw)
+            if _stopped():
+                break
             if progress_cb:
                 progress_cb(end_r, f"[{tf}] 캔들 수집 완료")
-        if progress_cb:
+
+        if not _stopped() and progress_cb:
             progress_cb(1.0, "1d / 240m / 60m 최신 캔들 수집 완료")
         return
 
     for fn_name in (
+        "run_collection_pipeline",
         "collect_all_timeframes",
         "collect_all",
         "collect_candles",
@@ -236,19 +258,37 @@ def run_training_direct(progress_cb=None):
     return res
 
 
-def run_scan_direct(top_n: int, min_prob_3: float, progress_cb=None) -> pd.DataFrame:
+def run_scan_direct(
+    top_n: int,
+    min_prob_3: float,
+    watchlist_n: int = 8,
+    watch_min_prob_3: float = 0.45,
+    progress_cb=None,
+) -> dict[str, pd.DataFrame]:
     if progress_cb:
-        progress_cb(0.15, "전 종목 스캔 중")
-    sig = inspect.signature(scan_market)
-    kwargs = {"top_n": top_n, "min_prob_3": min_prob_3, "save_to_db": True}
+        progress_cb(0.15, "전 종목 스캔 및 관심/대기 후보 분류 중")
+    sig = inspect.signature(scan_market_with_watchlist)
+    kwargs = {
+        "top_n": top_n,
+        "watchlist_n": watchlist_n,
+        "min_prob_3": min_prob_3,
+        "watch_min_prob_3": watch_min_prob_3,
+        "save_to_db": True,
+    }
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
     for kw in ("progress_callback", "on_progress", "progress_cb", "callback"):
         if kw in sig.parameters and progress_cb is not None:
-            kwargs[kw] = progress_cb
+            filtered_kwargs[kw] = progress_cb
             break
-    df = scan_market(**kwargs)
+    res = scan_market_with_watchlist(**filtered_kwargs)
     if progress_cb:
         progress_cb(1.0, "전 종목 스캔 완료")
-    return df
+    if isinstance(res, dict):
+        return {
+            "recommended": res.get("recommended", pd.DataFrame()),
+            "watchlist": res.get("watchlist", pd.DataFrame()),
+        }
+    return {"recommended": res if isinstance(res, pd.DataFrame) else pd.DataFrame(), "watchlist": pd.DataFrame()}
 
 
 # =====================================================================
@@ -326,12 +366,15 @@ def ensure_scalp_table():
             CREATE TABLE IF NOT EXISTS scalp_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 detected_at TEXT NOT NULL,
+                preset_name TEXT NOT NULL DEFAULT '커스텀',
                 market TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
                 current_price REAL NOT NULL,
                 rec_buy_price REAL NOT NULL,
                 rec_sell_price REAL NOT NULL,
                 target_pct REAL NOT NULL,
+                stop_loss_pct REAL NOT NULL DEFAULT 2.0,
+                verify_minutes INTEGER NOT NULL DEFAULT 15,
                 timing TEXT NOT NULL,
                 ret_pct REAL NOT NULL,
                 vol_mult REAL NOT NULL,
@@ -344,6 +387,13 @@ def ensure_scalp_table():
             )
             """
         )
+        cols = [row[1] for row in cur.execute("PRAGMA table_info(scalp_logs)").fetchall()]
+        if "preset_name" not in cols:
+            cur.execute("ALTER TABLE scalp_logs ADD COLUMN preset_name TEXT NOT NULL DEFAULT '커스텀'")
+        if "stop_loss_pct" not in cols:
+            cur.execute("ALTER TABLE scalp_logs ADD COLUMN stop_loss_pct REAL NOT NULL DEFAULT 2.0")
+        if "verify_minutes" not in cols:
+            cur.execute("ALTER TABLE scalp_logs ADD COLUMN verify_minutes INTEGER NOT NULL DEFAULT 15")
 
     _run_db_write(_create)
 
@@ -453,6 +503,35 @@ def reorder_columns_front(df: pd.DataFrame, priority_cols: list) -> pd.DataFrame
     return df[front + rest]
 
 
+def _get_1m_pullback_price(market: str, cur_price: float, low_price: float) -> tuple[float | None, str | None]:
+    """포착된 후보 종목에 한해 최근 1분봉 15개를 조회해 눌림 매수가 기준점을 계산"""
+    raw_1m = _fast_fetch_candles(market, timeframe="1m", count=15)
+    if not raw_1m or len(raw_1m) < 3:
+        return None, None
+
+    lows_1m = [float(c["low_price"]) for c in raw_1m[:10] if float(c.get("low_price", 0.0)) > 0]
+    closes_1m = [float(c["trade_price"]) for c in raw_1m[:5] if float(c.get("trade_price", 0.0)) > 0]
+    if not lows_1m:
+        return None, None
+
+    recent_1m_low = min(lows_1m)
+    recent_1m_med_low = float(statistics.median(sorted(lows_1m)[: max(1, len(lows_1m) // 2)]))
+    min_allowed = max(cur_price * 0.992, low_price * 0.998) if low_price > 0 else cur_price * 0.992
+
+    if recent_1m_low < cur_price * 0.999:
+        anchor = recent_1m_low if recent_1m_low >= min_allowed else recent_1m_med_low
+        candidate = max(min_allowed, min(anchor, cur_price * 0.999))
+        drop_pct = abs((candidate - cur_price) / cur_price * 100.0)
+        return candidate, f"1분봉 눌림 확인 진입 (-{drop_pct:.2f}% 저점 부근)"
+
+    if closes_1m and min(closes_1m) < cur_price * 0.9995:
+        candidate = max(min_allowed, min(min(closes_1m) * 0.9995, cur_price * 0.999))
+        drop_pct = abs((candidate - cur_price) / cur_price * 100.0)
+        return candidate, f"1분봉 단기 조정 진입 (-{drop_pct:.2f}% 부근)"
+
+    return None, None
+
+
 def build_scalp_plan(
     cur_price: float,
     open_price: float,
@@ -461,11 +540,20 @@ def build_scalp_plan(
     vol_mult: float,
     ret_pct: float,
     target_pct: float = 3.5,
+    market: str | None = None,
 ):
     span = max(high_price - low_price, 0.0)
     upper_wick_ratio = ((high_price - max(cur_price, open_price)) / span) if span > 0 else 0.0
 
-    if vol_mult >= 6.0 and ret_pct >= 4.5:
+    pullback_buy, pullback_timing = (None, None)
+    if market:
+        time.sleep(0.02)
+        pullback_buy, pullback_timing = _get_1m_pullback_price(market, cur_price, low_price)
+
+    if pullback_buy is not None and pullback_timing is not None:
+        buy_raw = pullback_buy
+        timing = pullback_timing
+    elif vol_mult >= 6.0 and ret_pct >= 4.5:
         buy_raw = cur_price * 0.9970
         timing = "초단기 숨고르기 후 진입 (3–10분 내 -0.3% 부근)"
     elif upper_wick_ratio >= 0.35 or ret_pct >= 3.2:
@@ -478,7 +566,7 @@ def build_scalp_plan(
         buy_raw = cur_price * 0.9997
         timing = "즉시 진입 유효 (0–5분 내 현재가 근접)"
 
-    lower_bound = max(low_price * 0.998, cur_price * 0.995) if low_price > 0 else cur_price * 0.995
+    lower_bound = max(low_price * 0.998, cur_price * 0.992) if low_price > 0 else cur_price * 0.992
     rec_buy = format_price(max(lower_bound, min(buy_raw, cur_price)))
     rec_sell = format_price(rec_buy * (1.0 + max(0.5, float(target_pct)) / 100.0))
     if rec_sell <= rec_buy:
@@ -677,7 +765,7 @@ def models_ready() -> bool:
 
 
 # =====================================================================
-# 단타 포착(초입 수급 필터 + KST 기준) 및 검증
+# 단타 포착(초입 수급 필터 + 1분봉 눌림 보정 + 프리셋/검증기준 기록) 및 검증
 # =====================================================================
 def _evaluate_single_spike(
     m: str,
@@ -687,6 +775,9 @@ def _evaluate_single_spike(
     max_ret_pct: float,
     min_trade_krw: int,
     target_pct: float,
+    stop_loss_pct: float = 2.0,
+    verify_minutes: int = 15,
+    preset_name: str = "커스텀",
 ):
     time.sleep(0.03)
     raw = _fast_fetch_candles(m, timeframe=timeframe, count=24)
@@ -747,14 +838,20 @@ def _evaluate_single_spike(
         vol_mult=vol_mult,
         ret_pct=best_ret_pct,
         target_pct=target_pct,
+        market=m,
     )
     cur_fmt = format_price(cur_price)
     ret_fmt = round(best_ret_pct, 2)
     vol_fmt = round(vol_mult, 2)
     val_man = int(trade_val_krw // 10_000)
+    stop_fmt = round(float(stop_loss_pct), 1)
+    ver_min_int = max(1, int(round(verify_minutes)))
 
     display_row = {
         "코인": format_coin_label(m),
+        "세팅(프리셋)": preset_name,
+        "검증기준(분)": ver_min_int,
+        "손절기준(%)": stop_fmt,
         "추천매수금액": rec_buy,
         "추천매도금액": rec_sell,
         "거래량배율(배)": vol_fmt,
@@ -765,8 +862,8 @@ def _evaluate_single_spike(
         "봉": timeframe,
     }
     db_tuple = (
-        m, timeframe, cur_fmt,
-        rec_buy, rec_sell, float(target_pct), timing,
+        preset_name, m, timeframe, cur_fmt,
+        rec_buy, rec_sell, float(target_pct), stop_fmt, ver_min_int, timing,
         ret_fmt, vol_fmt, trade_val_krw,
     )
     return display_row, db_tuple
@@ -779,7 +876,10 @@ def detect_volume_spikes(
     max_ret_pct: float = 8.0,
     min_trade_krw: int = 30_000_000,
     target_pct: float = 3.5,
+    stop_loss_pct: float = 2.0,
+    verify_minutes: int = 15,
     max_coins: int = 60,
+    preset_name: str = "커스텀",
     save_to_db: bool = True,
     progress_cb=None,
 ) -> pd.DataFrame:
@@ -809,6 +909,9 @@ def detect_volume_spikes(
                 max_ret_pct,
                 min_trade_krw,
                 target_pct,
+                stop_loss_pct,
+                verify_minutes,
+                preset_name,
             )
             for m in markets
         ]
@@ -831,11 +934,11 @@ def detect_volume_spikes(
             conn.executemany(
                 """
                 INSERT INTO scalp_logs (
-                    detected_at, market, timeframe, current_price,
-                    rec_buy_price, rec_sell_price, target_pct, timing,
+                    detected_at, preset_name, market, timeframe, current_price,
+                    rec_buy_price, rec_sell_price, target_pct, stop_loss_pct, verify_minutes, timing,
                     ret_pct, vol_mult, trade_val_krw,
                     bought, max_gain_pct, outcome, status_detail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0.0, 'PENDING', '대기중')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0.0, 'PENDING', '대기중')
                 """,
                 db_rows,
             )
@@ -871,23 +974,32 @@ def _filter_window_candles(raw_candles: list, start_dt: datetime, end_dt: dateti
 
 def _verify_single_scalp(
     row_dict: dict,
-    expire_hours: float,
-    stop_loss_pct: float,
+    fallback_expire_hours: float,
+    fallback_stop_loss_pct: float,
     now_dt: datetime,
 ):
     det_dt = _parse_dt_safe(row_dict.get("detected_at"))
     if det_dt is None:
         return None
 
+    saved_ver_min = _to_float_safe(row_dict.get("verify_minutes"))
+    if saved_ver_min is not None and saved_ver_min > 0:
+        window_minutes = max(1, int(round(saved_ver_min)))
+    else:
+        window_minutes = max(1, int(round(fallback_expire_hours * 60)))
+
+    saved_stop_pct = _to_float_safe(row_dict.get("stop_loss_pct"))
+    row_stop_loss_pct = float(saved_stop_pct) if saved_stop_pct is not None and saved_stop_pct >= 0 else float(fallback_stop_loss_pct)
+
     market = row_dict["market"]
-    window_minutes = max(1, int(round(expire_hours * 60)))
     end_dt = det_dt + timedelta(minutes=window_minutes)
     elapsed_minutes = (now_dt - det_dt).total_seconds() / 60.0
 
-    needed_1m = int(min(120, max(10, elapsed_minutes + 5)))
+    needed_1m = int(min(180, max(10, window_minutes + 5)))
     raw_1m = _fast_fetch_candles(market, timeframe="1m", count=needed_1m)
     time.sleep(0.03)
-    raw_5m = _fast_fetch_candles(market, timeframe="5m", count=20)
+    needed_5m = int(min(60, max(20, (window_minutes // 5) + 8)))
+    raw_5m = _fast_fetch_candles(market, timeframe="5m", count=needed_5m)
 
     w_1m = _filter_window_candles(raw_1m, det_dt, min(now_dt, end_dt))
     w_5m = _filter_window_candles(raw_5m, det_dt, min(now_dt, end_dt))
@@ -911,7 +1023,7 @@ def _verify_single_scalp(
 
     rec_buy = float(row_dict["rec_buy_price"])
     rec_sell = float(row_dict["rec_sell_price"])
-    stop_price = rec_buy * (1.0 - max(0.0, float(stop_loss_pct)) / 100.0)
+    stop_price = rec_buy * (1.0 - max(0.0, row_stop_loss_pct) / 100.0)
     bought = int(bool(row_dict["bought"]) or (min_low <= rec_buy))
 
     base_ref = rec_buy if bought else float(row_dict["current_price"])
@@ -921,25 +1033,25 @@ def _verify_single_scalp(
     outcome = row_dict["outcome"]
     status_detail = row_dict["status_detail"]
 
-    if bought and stop_loss_pct > 0 and min_low <= stop_price:
+    if bought and row_stop_loss_pct > 0 and min_low <= stop_price:
         outcome = "FAIL"
-        status_detail = f"{window_minutes}분 내 손절가(-{stop_loss_pct:.1f}% / {fmt_krw(stop_price)}) 이탈"
+        status_detail = f"{window_minutes}분 기준 손절가(-{row_stop_loss_pct:.1f}% / {fmt_krw(stop_price)}) 이탈"
     elif bought and max_high >= rec_sell:
         outcome = "SUCCESS"
-        status_detail = f"{window_minutes}분 내 매수({fmt_krw(rec_buy)})·목표({fmt_krw(rec_sell)}) 도달"
+        status_detail = f"{window_minutes}분 기준 매수({fmt_krw(rec_buy)})·목표({fmt_krw(rec_sell)}) 도달"
     elif elapsed_minutes >= window_minutes:
         outcome = "FAIL"
         status_detail = (
-            f"{window_minutes}분 내 목표가 미달 (최저 {fmt_krw(min_low)} / 최고 {fmt_krw(max_high)})"
+            f"{window_minutes}분 기준 목표가 미달 (최저 {fmt_krw(min_low)} / 최고 {fmt_krw(max_high)})"
             if bought
-            else f"{window_minutes}분 내 매수가({fmt_krw(rec_buy)}) 미도달 (최저 {fmt_krw(min_low)})"
+            else f"{window_minutes}분 기준 매수가({fmt_krw(rec_buy)}) 미도달 (최저 {fmt_krw(min_low)})"
         )
     else:
         remain_min = max(1, int(round(window_minutes - elapsed_minutes)))
         status_detail = (
-            f"대기중 (매수체결 · 남은 {remain_min}분)"
+            f"대기중 · {window_minutes}분 기준 (매수체결 · 남은 {remain_min}분)"
             if bought
-            else f"대기중 (매수가 대기 · 남은 {remain_min}분)"
+            else f"대기중 · {window_minutes}분 기준 (매수가 대기 · 남은 {remain_min}분)"
         )
 
     changed = (
@@ -1001,7 +1113,7 @@ def verify_scalp_predictions(
             done_l += 1
             if progress_cb:
                 ratio = 0.10 + 0.80 * (done_l / total_l)
-                progress_cb(ratio, f"단타 로그 검증 중 ({done_l}/{total_l})")
+                progress_cb(ratio, f"단타 로그 개별 기준 채점 중 ({done_l}/{total_l})")
             res = fut.result()
             if res is not None:
                 bought, max_gain_pct, outcome, status_detail, row_id = res
@@ -1050,8 +1162,13 @@ def get_scalp_statistics() -> dict:
             "fail": 0,
             "win_rate": 0.0,
             "avg_max_gain": 0.0,
+            "by_preset": pd.DataFrame(),
             "by_vol": pd.DataFrame(),
         }
+
+    if "preset_name" not in df.columns:
+        df["preset_name"] = "커스텀"
+    df["preset_name"] = df["preset_name"].fillna("커스텀").replace({"": "커스텀"})
 
     settled_df = df[df["outcome"].isin(["SUCCESS", "FAIL"])]
     total = len(df)
@@ -1060,6 +1177,27 @@ def get_scalp_statistics() -> dict:
     fail = int((settled_df["outcome"] == "FAIL").sum())
     win_rate = round((success / settled * 100.0), 1) if settled > 0 else 0.0
     avg_max_gain = round(float(settled_df["max_gain_pct"].mean()), 2) if settled > 0 else 0.0
+
+    preset_rows = []
+    ordered_presets = list(SCALP_PRESETS.keys()) + ["커스텀"]
+    extra_presets = [p for p in df["preset_name"].unique().tolist() if p not in ordered_presets]
+    for p_name in ordered_presets + extra_presets:
+        sub_all = df[df["preset_name"] == p_name]
+        if sub_all.empty:
+            continue
+        sub_set = settled_df[settled_df["preset_name"] == p_name]
+        s_cnt = int((sub_set["outcome"] == "SUCCESS").sum())
+        tot_s = len(sub_set)
+        rate = round((s_cnt / tot_s * 100.0), 1) if tot_s > 0 else 0.0
+        avg_g = round(float(sub_set["max_gain_pct"].mean()), 2) if tot_s > 0 else 0.0
+        preset_rows.append({
+            "세팅(프리셋)": p_name,
+            "포착건수": fmt_int_comma(len(sub_all)),
+            "판정건수": fmt_int_comma(tot_s),
+            "성공건수": fmt_int_comma(s_cnt),
+            "실제성공률(%)": rate,
+            "평균최고수익(%)": avg_g,
+        })
 
     vol_rows = []
     buckets = [
@@ -1088,41 +1226,53 @@ def get_scalp_statistics() -> dict:
         "fail": fail,
         "win_rate": win_rate,
         "avg_max_gain": avg_max_gain,
+        "by_preset": pd.DataFrame(preset_rows),
         "by_vol": pd.DataFrame(vol_rows),
     }
 
 
-def load_scalp_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.DataFrame:
+def load_scalp_logs(
+    limit: int = 200,
+    outcome_filter: str = "전체",
+    preset_filter: str = "전체",
+) -> pd.DataFrame:
     ensure_scalp_table()
     conn = get_db_connection(timeout=30.0)
     try:
         base_sql = """
             SELECT
-                id, detected_at, market, timeframe, current_price,
-                rec_buy_price, rec_sell_price, target_pct, timing,
+                id, detected_at, preset_name, market, timeframe, current_price,
+                rec_buy_price, rec_sell_price, target_pct, stop_loss_pct, verify_minutes, timing,
                 ret_pct, vol_mult, bought, max_gain_pct,
                 outcome, status_detail, verified_at
             FROM scalp_logs
         """
+        conditions = []
+        params = []
         code_map = {"성공": "SUCCESS", "실패": "FAIL", "대기중": "PENDING"}
         if outcome_filter in code_map:
-            df = pd.read_sql_query(
-                base_sql + " WHERE outcome = ? ORDER BY id DESC LIMIT ?",
-                conn,
-                params=(code_map[outcome_filter], limit),
-            )
-        else:
-            df = pd.read_sql_query(
-                base_sql + " ORDER BY id DESC LIMIT ?",
-                conn,
-                params=(limit,),
-            )
+            conditions.append("outcome = ?")
+            params.append(code_map[outcome_filter])
+        if preset_filter and preset_filter != "전체":
+            conditions.append("preset_name = ?")
+            params.append(preset_filter)
+
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
+        df = pd.read_sql_query(
+            base_sql + where_clause + " ORDER BY id DESC LIMIT ?",
+            conn,
+            params=tuple(params),
+        )
     finally:
         conn.close()
 
     if df.empty:
         return df
 
+    df["preset_name"] = df["preset_name"].fillna("커스텀").replace({"": "커스텀"})
+    df["verify_minutes"] = df["verify_minutes"].fillna(15).astype(int)
+    df["stop_loss_pct"] = df["stop_loss_pct"].fillna(2.0).astype(float).round(1)
     df["bought"] = df["bought"].apply(lambda x: "체결됨" if int(x or 0) == 1 else "미체결")
     df["outcome"] = df["outcome"].apply(_translate_outcome)
     df["status_detail"] = df["status_detail"].replace({"PENDING": "대기중"})
@@ -1130,6 +1280,9 @@ def load_scalp_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.Data
     renamed = df.rename(columns={
         "id": "번호",
         "detected_at": "포착시각",
+        "preset_name": "세팅(프리셋)",
+        "verify_minutes": "검증기준(분)",
+        "stop_loss_pct": "손절기준(%)",
         "market": "코인",
         "timeframe": "봉",
         "current_price": "포착시점현재가",
@@ -1149,11 +1302,25 @@ def load_scalp_logs(limit: int = 200, outcome_filter: str = "전체") -> pd.Data
     formatted = format_price_columns(
         renamed,
         price_cols=["포착시점현재가", "추천매수금액", "추천매도금액"],
-        int_cols=["번호"],
+        int_cols=["번호", "검증기준(분)"],
     )
     return reorder_columns_front(
         formatted,
-        ["포착시각", "코인", "추천매수금액", "추천매도금액", "거래량배율(배)", "상승률(%)", "최고수익(%)", "매수여부", "결과", "상세상태"],
+        [
+            "포착시각",
+            "세팅(프리셋)",
+            "검증기준(분)",
+            "손절기준(%)",
+            "코인",
+            "추천매수금액",
+            "추천매도금액",
+            "거래량배율(배)",
+            "상승률(%)",
+            "최고수익(%)",
+            "매수여부",
+            "결과",
+            "상세상태",
+        ],
     )
 
 
@@ -1226,14 +1393,44 @@ SCALP_PRESETS = {
     },
 }
 
+_SETTING_KEYS = (
+    "spike_tf",
+    "min_vol_mult",
+    "min_ret_pct",
+    "target_pct",
+    "stop_loss_pct",
+    "verify_minutes",
+    "max_coins",
+)
+
 _DEFAULT_PRESET_NAME = "추천1. 5분 초단타 셋팅"
 _DEFAULT_PRESET_VALS = SCALP_PRESETS[_DEFAULT_PRESET_NAME]
 
 if "scalp_preset_select" not in st.session_state:
     st.session_state["scalp_preset_select"] = _DEFAULT_PRESET_NAME
+if "active_preset_name" not in st.session_state:
+    st.session_state["active_preset_name"] = _DEFAULT_PRESET_NAME
 for _k, _v in _DEFAULT_PRESET_VALS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+
+def _is_same_setting_val(a, b) -> bool:
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) < 1e-6
+    return str(a) == str(b)
+
+
+def _find_matching_preset_in_state() -> str | None:
+    selected = st.session_state.get("scalp_preset_select")
+    order = ([selected] if selected in SCALP_PRESETS else []) + [
+        k for k in SCALP_PRESETS.keys() if k != selected
+    ]
+    for name in order:
+        cfg = SCALP_PRESETS[name]
+        if all(_is_same_setting_val(st.session_state.get(k), cfg[k]) for k in _SETTING_KEYS):
+            return name
+    return None
 
 
 def _apply_selected_scalp_preset():
@@ -1243,6 +1440,15 @@ def _apply_selected_scalp_preset():
         return
     for k, v in cfg.items():
         st.session_state[k] = v
+    st.session_state["active_preset_name"] = chosen
+
+
+def _mark_custom_if_modified():
+    matched = _find_matching_preset_in_state()
+    if matched is not None:
+        st.session_state["active_preset_name"] = matched
+    else:
+        st.session_state["active_preset_name"] = "커스텀"
 
 
 # =====================================================================
@@ -1257,33 +1463,66 @@ if "last_reset_msg" not in st.session_state:
     st.session_state["last_reset_msg"] = None
 if "scan_result_df" not in st.session_state:
     st.session_state["scan_result_df"] = None
+if "watchlist_result_df" not in st.session_state:
+    st.session_state["watchlist_result_df"] = None
 if "scalp_result_df" not in st.session_state:
     st.session_state["scalp_result_df"] = None
+if "stop_collect_requested" not in st.session_state:
+    st.session_state["stop_collect_requested"] = False
+if "collect_status_msg" not in st.session_state:
+    st.session_state["collect_status_msg"] = None
+if "train_status_msg" not in st.session_state:
+    st.session_state["train_status_msg"] = None
 
 with st.sidebar:
     st.header("⚙️ 제어 패널")
     top_n = st.slider("AI 표시 상위 코인 수", min_value=3, max_value=30, value=10, step=1)
     min_prob_3 = st.slider("AI 최소 +3% 확률 필터 (%)", min_value=30, max_value=85, value=55, step=5) / 100.0
+    watch_min_prob_3 = st.slider("관심/대기 최소 +3% 확률 (%)", min_value=30, max_value=70, value=45, step=5) / 100.0
     success_target = st.selectbox("AI 성공 판정 목표", options=[3, 5, 10, 20], index=0)
 
-    if st.button("🔄 화면 새로고침", use_container_width=True):
+    if st.button("🔄 화면 새로고침", width="stretch"):
         st.rerun()
 
     st.divider()
-    if st.button("📥 최신 캔들 데이터 수집", use_container_width=True):
+    c_col1, c_col2 = st.columns(2)
+    with c_col1:
+        start_collect_clicked = st.button("📥 캔들 수집", width="stretch")
+    with c_col2:
+        if st.button("🛑 수집 중지", width="stretch"):
+            st.session_state["stop_collect_requested"] = True
+            st.session_state["collect_status_msg"] = "🛑 수집 중지 요청됨 — 현재 작업 마무리 후 멈춥니다."
+            st.rerun()
+
+    if st.session_state["collect_status_msg"]:
+        st.caption(st.session_state["collect_status_msg"])
+
+    if start_collect_clicked:
+        st.session_state["stop_collect_requested"] = False
+        st.session_state["collect_status_msg"] = None
         p_bar = st.progress(0.02)
         p_cap = st.empty()
         cb = _make_ui_progress_cb(p_bar, p_cap)
         try:
-            run_collector_direct(progress_cb=cb)
-            p_bar.progress(1.0)
-            p_cap.caption("✅ 최신 캔들 수집 완료 (100%)")
+            def _is_stop_requested() -> bool:
+                return bool(st.session_state.get("stop_collect_requested", False))
+
+            run_collector_direct(progress_cb=cb, stop_check=_is_stop_requested, force=False)
+            if _is_stop_requested():
+                st.session_state["collect_status_msg"] = "🛑 수집이 중지되었습니다. (지금까지 수집된 데이터는 DB에 저장됨)"
+            else:
+                p_bar.progress(1.0)
+                p_cap.caption("✅ 최신 캔들 수집 완료 (100%)")
+                st.session_state["collect_status_msg"] = "✅ 1d / 240m / 60m 수집 완료"
+            st.session_state["stop_collect_requested"] = False
             st.rerun()
         except Exception as exc:
+            st.session_state["stop_collect_requested"] = False
             st.error(f"❌ 수집 오류: {type(exc).__name__}: {exc}")
 
     st.divider()
-    if st.button("🧠 AI 모델 학습/재학습", use_container_width=True):
+    if st.button("🧠 AI 모델 학습/재학습", width="stretch"):
+        st.session_state["train_status_msg"] = None
         p_bar = st.progress(0.05)
         p_cap = st.empty()
         cb = _make_ui_progress_cb(p_bar, p_cap)
@@ -1291,25 +1530,37 @@ with st.sidebar:
             run_training_direct(progress_cb=cb)
             p_bar.progress(1.0)
             p_cap.caption("✅ AI 모델 학습 완료 (100%)")
+            st.session_state["train_status_msg"] = f"✅ AI 모델 학습 완료 ({now_kst_str('%H:%M:%S')})"
             st.rerun()
         except Exception as exc:
+            st.session_state["train_status_msg"] = f"❌ 학습 실패 ({now_kst_str('%H:%M:%S')})"
             st.error(f"❌ 학습 오류: {type(exc).__name__}: {exc}")
 
+    if st.session_state["train_status_msg"]:
+        st.caption(st.session_state["train_status_msg"])
+
     st.divider()
-    if st.button("🔍 지금 전 종목 AI 스캔", type="primary", use_container_width=True):
+    if st.button("🔍 지금 전 종목 AI 스캔", type="primary", width="stretch"):
         p_bar = st.progress(0.05)
         p_cap = st.empty()
         cb = _make_ui_progress_cb(p_bar, p_cap)
         try:
-            df_res = run_scan_direct(top_n=top_n, min_prob_3=min_prob_3, progress_cb=cb)
-            st.session_state["scan_result_df"] = df_res
+            scan_bundle = run_scan_direct(
+                top_n=top_n,
+                min_prob_3=min_prob_3,
+                watchlist_n=8,
+                watch_min_prob_3=watch_min_prob_3,
+                progress_cb=cb,
+            )
+            st.session_state["scan_result_df"] = scan_bundle.get("recommended", pd.DataFrame())
+            st.session_state["watchlist_result_df"] = scan_bundle.get("watchlist", pd.DataFrame())
             p_bar.progress(1.0)
             p_cap.caption("✅ 전 종목 스캔 완료 (100%)")
         except Exception as exc:
             st.error(f"❌ 스캔 오류: {type(exc).__name__}: {exc}")
 
     st.divider()
-    if st.button("✅ AI 성공여부 검증", use_container_width=True):
+    if st.button("✅ AI 성공여부 검증", width="stretch"):
         p_bar = st.progress(0.10)
         p_cap = st.empty()
         cb = _make_ui_progress_cb(p_bar, p_cap)
@@ -1333,7 +1584,7 @@ with st.sidebar:
         st.session_state["last_reset_msg"] = None
 
     can_reset = (reset_scalp_chk or reset_ai_chk) and confirm_reset_chk
-    if st.button("🧹 선택 통계 초기화 실행", use_container_width=True, disabled=not can_reset):
+    if st.button("🧹 선택 통계 초기화 실행", width="stretch", disabled=not can_reset):
         cleared = []
         if reset_scalp_chk:
             reset_scalp_logs()
@@ -1342,6 +1593,7 @@ with st.sidebar:
         if reset_ai_chk:
             reset_prediction_logs()
             st.session_state["scan_result_df"] = None
+            st.session_state["watchlist_result_df"] = None
             cleared.append("AI 통계")
 
         st.session_state["reset_nonce"] = nonce + 1
@@ -1361,20 +1613,73 @@ st.selectbox(
 )
 
 r1_c1, r1_c2, r1_c3 = st.columns(3)
-spike_tf = r1_c1.selectbox("감지 봉", options=["5m", "15m"], key="spike_tf")
-min_vol_mult = r1_c2.slider("거래량 배율 (배)", min_value=1.5, max_value=10.0, step=0.5, key="min_vol_mult")
-min_ret_pct = r1_c3.slider("최소 상승률 (%)", min_value=0.5, max_value=10.0, step=0.5, key="min_ret_pct")
+spike_tf = r1_c1.selectbox(
+    "감지 봉",
+    options=["5m", "15m"],
+    key="spike_tf",
+    on_change=_mark_custom_if_modified,
+)
+min_vol_mult = r1_c2.slider(
+    "거래량 배율 (배)",
+    min_value=1.5,
+    max_value=10.0,
+    step=0.5,
+    key="min_vol_mult",
+    on_change=_mark_custom_if_modified,
+)
+min_ret_pct = r1_c3.slider(
+    "최소 상승률 (%)",
+    min_value=0.5,
+    max_value=10.0,
+    step=0.5,
+    key="min_ret_pct",
+    on_change=_mark_custom_if_modified,
+)
 
 r2_c1, r2_c2, r2_c3 = st.columns(3)
-target_pct = r2_c1.slider("목표수익 (%)", min_value=1.0, max_value=10.0, step=0.5, key="target_pct")
-stop_loss_pct = r2_c2.slider("손절 기준 (%)", min_value=0.5, max_value=5.0, step=0.5, key="stop_loss_pct")
-verify_minutes = r2_c3.slider("검증 시간 (분)", min_value=10, max_value=60, step=5, key="verify_minutes")
+target_pct = r2_c1.slider(
+    "목표수익 (%)",
+    min_value=1.0,
+    max_value=10.0,
+    step=0.5,
+    key="target_pct",
+    on_change=_mark_custom_if_modified,
+)
+stop_loss_pct = r2_c2.slider(
+    "손절 기준 (%)",
+    min_value=0.5,
+    max_value=5.0,
+    step=0.5,
+    key="stop_loss_pct",
+    on_change=_mark_custom_if_modified,
+)
+verify_minutes = r2_c3.slider(
+    "검증 시간 (분)",
+    min_value=10,
+    max_value=60,
+    step=5,
+    key="verify_minutes",
+    on_change=_mark_custom_if_modified,
+)
 
-max_coins = st.slider("거래대금 상위 탐색 수", min_value=10, max_value=296, step=10, key="max_coins")
+max_coins = st.slider(
+    "거래대금 상위 탐색 수",
+    min_value=10,
+    max_value=296,
+    step=10,
+    key="max_coins",
+    on_change=_mark_custom_if_modified,
+)
+
+active_preset_label = st.session_state.get("active_preset_name") or _DEFAULT_PRESET_NAME
+st.caption(
+    f"현재 적용 기록 세팅: **{active_preset_label}** · "
+    f"포착 시 저장되는 기준: **검증 {verify_minutes}분 / 손절 -{stop_loss_pct:.1f}%**"
+)
 
 b_col1, b_col2 = st.columns([2, 1])
 with b_col1:
-    if st.button("⚡ 지금 단타 종목 포착하기", type="primary", use_container_width=True):
+    if st.button("⚡ 지금 단타 종목 포착하기", type="primary", width="stretch"):
         s_bar = st.progress(0.05)
         s_cap = st.empty()
         s_cb = _make_ui_progress_cb(s_bar, s_cap)
@@ -1386,18 +1691,21 @@ with b_col1:
                 max_ret_pct=8.0,
                 min_trade_krw=30_000_000,
                 target_pct=target_pct,
+                stop_loss_pct=stop_loss_pct,
+                verify_minutes=verify_minutes,
                 max_coins=max_coins,
+                preset_name=active_preset_label,
                 save_to_db=True,
                 progress_cb=s_cb,
             )
             st.session_state["scalp_result_df"] = sp_df
             s_bar.progress(1.0)
-            s_cap.caption("✅ 단타 포착 완료 (100%)")
+            s_cap.caption(f"✅ 단타 포착 완료 [{active_preset_label} · {verify_minutes}분] (100%)")
         except Exception as exc:
             st.error(f"❌ 단타 포착 오류: {type(exc).__name__}: {exc}")
 
 with b_col2:
-    if st.button(f"✅ 단타 검증 ({verify_minutes}분)", use_container_width=True):
+    if st.button("✅ 단타 검증 (로그별 기준)", width="stretch"):
         v_bar = st.progress(0.05)
         v_cap = st.empty()
         v_cb = _make_ui_progress_cb(v_bar, v_cap)
@@ -1419,13 +1727,24 @@ if isinstance(spike_df, pd.DataFrame) and not spike_df.empty:
     formatted_spike = format_price_columns(
         formatted_spike,
         price_cols=["추천매수금액", "추천매도금액", "포착시점현재가"],
-        int_cols=["거래대금(만원)"],
+        int_cols=["거래대금(만원)", "검증기준(분)"],
     )
     formatted_spike = reorder_columns_front(
         formatted_spike,
-        ["코인", "추천매수금액", "추천매도금액", "거래량배율(배)", "상승률(%)", "추천매수타이밍", "포착시점현재가"],
+        [
+            "코인",
+            "세팅(프리셋)",
+            "검증기준(분)",
+            "손절기준(%)",
+            "추천매수금액",
+            "추천매도금액",
+            "거래량배율(배)",
+            "상승률(%)",
+            "추천매수타이밍",
+            "포착시점현재가",
+        ],
     )
-    st.dataframe(formatted_spike, use_container_width=True, hide_index=True)
+    st.dataframe(formatted_spike, width="stretch", hide_index=True)
 elif isinstance(spike_df, pd.DataFrame) and spike_df.empty:
     st.info("현재 조건에 맞는 단타 종목이 없습니다. 거래량 배율이나 최소 상승률을 낮춰 다시 눌러보세요.")
 
@@ -1449,28 +1768,47 @@ else:
     s5.metric("실패", f"{scalp_stat['fail']:,}건")
     s6.metric("판정건 평균 최고수익", f"{scalp_stat['avg_max_gain']}%")
 
-    scalp_filter = st.radio(
-        "단타 로그 필터",
-        options=["전체", "성공", "실패", "대기중"],
-        horizontal=True,
-        key="scalp_filter_radio",
+    if not scalp_stat["by_preset"].empty:
+        st.caption("📊 추천 세팅(프리셋)별 단타 성적 비교")
+        st.dataframe(scalp_stat["by_preset"], width="stretch", hide_index=True)
+
+    f_c1, f_c2 = st.columns([2, 1])
+    with f_c1:
+        scalp_filter = st.radio(
+            "단타 결과 필터",
+            options=["전체", "성공", "실패", "대기중"],
+            horizontal=True,
+            key="scalp_filter_radio",
+        )
+    with f_c2:
+        preset_options = ["전체"] + list(SCALP_PRESETS.keys()) + ["커스텀"]
+        scalp_preset_filter = st.selectbox(
+            "세팅(프리셋) 필터",
+            options=preset_options,
+            key="scalp_preset_filter_select",
+        )
+
+    scalp_logs_df = load_scalp_logs(
+        limit=200,
+        outcome_filter=scalp_filter,
+        preset_filter=scalp_preset_filter,
     )
-    scalp_logs_df = load_scalp_logs(limit=200, outcome_filter=scalp_filter)
-    st.dataframe(scalp_logs_df, use_container_width=True, hide_index=True)
+    st.dataframe(scalp_logs_df, width="stretch", hide_index=True)
 
     with st.expander("거래량 배율 구간별 단타 성공률 보기"):
         if not scalp_stat["by_vol"].empty:
-            st.dataframe(scalp_stat["by_vol"], use_container_width=True, hide_index=True)
+            st.dataframe(scalp_stat["by_vol"], width="stretch", hide_index=True)
 
 st.divider()
 
 # =====================================================================
-# 3. AI 스캔 결과 & 누적 AI 추천 통계
+# 3. AI 스캔 결과 & 관심/대기 후보 & 누적 AI 추천 통계
 # =====================================================================
 st.subheader("3. AI 상승 확률 스캔 & 누적 추천 통계")
 if not models_ready():
     st.info("아직 학습된 모델 파일(`models/lgb_target_*.txt`)이 없습니다. 왼쪽 메뉴에서 학습을 진행해 주세요.")
 
+st.caption(f"🎯 **실전 추천 매수 기준:** +3% 확률 **{int(round(min_prob_3 * 100))}%** 이상 (로그 기록 대상)")
 scan_df = st.session_state.get("scan_result_df")
 if isinstance(scan_df, pd.DataFrame) and not scan_df.empty:
     formatted_scan = attach_korean_coin_names(scan_df, col_name="코인")
@@ -1478,9 +1816,24 @@ if isinstance(scan_df, pd.DataFrame) and not scan_df.empty:
         formatted_scan,
         price_cols=["현재가", "추천매수가", "손절가", "목표+3%", "목표+5%", "목표+10%", "목표+20%"],
     )
-    st.dataframe(formatted_scan, use_container_width=True, hide_index=True)
+    st.dataframe(formatted_scan, width="stretch", hide_index=True)
 elif isinstance(scan_df, pd.DataFrame) and scan_df.empty:
-    st.info("현재 필터 조건을 충족하는 AI 스캔 종목이 없습니다.")
+    st.info(f"현재 +3% 확률 {int(round(min_prob_3 * 100))}% 기준을 충족하는 추천 매수 종목이 없습니다.")
+
+watch_df = st.session_state.get("watchlist_result_df")
+if isinstance(watch_df, pd.DataFrame):
+    st.markdown(
+        f"👀 **관심/대기 후보** (+3% 확률 **{int(round(watch_min_prob_3 * 100))}~{max(int(round(watch_min_prob_3 * 100)), int(round(min_prob_3 * 100)) - 1)}%** · 추세/수급/과열 필터 통과 · 통계 미포함)"
+    )
+    if not watch_df.empty:
+        formatted_watch = attach_korean_coin_names(watch_df, col_name="코인")
+        formatted_watch = format_price_columns(
+            formatted_watch,
+            price_cols=["현재가"],
+        )
+        st.dataframe(formatted_watch, width="stretch", hide_index=True)
+    else:
+        st.caption("현재 관심/대기 조건을 만족하는 후보 종목이 없습니다.")
 
 with st.expander("누적 AI 추천 리스트 & 성공/실패 통계 보기"):
     stat_bundle = get_prediction_statistics()
@@ -1496,11 +1849,11 @@ with st.expander("누적 AI 추천 리스트 & 성공/실패 통계 보기"):
 
         reason_df = get_ai_reason_summary()
         if not reason_df.empty:
-            st.dataframe(reason_df, use_container_width=True, hide_index=True)
+            st.dataframe(reason_df, width="stretch", hide_index=True)
 
         target_stats_df = stat_bundle["target_stats"]
         if not target_stats_df.empty:
-            st.dataframe(target_stats_df, use_container_width=True, hide_index=True)
+            st.dataframe(target_stats_df, width="stretch", hide_index=True)
 
         filter_choice = st.radio(
             "AI 로그 필터",
@@ -1509,7 +1862,7 @@ with st.expander("누적 AI 추천 리스트 & 성공/실패 통계 보기"):
             key="ai_filter_radio",
         )
         logs_df = load_prediction_logs(limit=200, outcome_filter=filter_choice)
-        st.dataframe(logs_df, use_container_width=True, hide_index=True)
+        st.dataframe(logs_df, width="stretch", hide_index=True)
 
 with st.expander("DB 수집 현황 (1d / 240m / 60m) 보기"):
     stats_df = load_db_stats()
@@ -1526,4 +1879,16 @@ with st.expander("DB 수집 현황 (1d / 240m / 60m) 보기"):
                     value=f"{int(r['candle_count']):,}개",
                     delta=f"{int(r['coin_count']):,}개 코인",
                 )
-                st.caption(f"기간: {str(r['earliest_kst'])[:10]} ~ {str(r['latest_kst'])[:10]}")
+                earliest_dt = _parse_dt_safe(r["earliest_kst"])
+                latest_dt = _parse_dt_safe(r["latest_kst"])
+                earliest_str = (
+                    earliest_dt.strftime("%Y-%m-%d %H:%M")
+                    if earliest_dt
+                    else str(r["earliest_kst"])[:16].replace("T", " ")
+                )
+                latest_str = (
+                    latest_dt.strftime("%Y-%m-%d %H:%M")
+                    if latest_dt
+                    else str(r["latest_kst"])[:16].replace("T", " ")
+                )
+                st.caption(f"기간: {earliest_str} ~ {latest_str}")

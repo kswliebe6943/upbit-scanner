@@ -1,263 +1,479 @@
+import json
 import sqlite3
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any
+
 import pandas as pd
 import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "crypto_data.db"
+STATE_PATH = BASE_DIR / "collect_state.json"
 
-UPBIT_BASE_URL = "https://api.upbit.com/v1"
+UPBIT_BASE_URL = "https://api.upbit.com"
+UPBIT_MARKETS_URL = f"{UPBIT_BASE_URL}/v1/market/all"
+UPBIT_CANDLE_URLS = {
+    "60m": f"{UPBIT_BASE_URL}/v1/candles/minutes/60",
+    "240m": f"{UPBIT_BASE_URL}/v1/candles/minutes/240",
+    "1d": f"{UPBIT_BASE_URL}/v1/candles/days",
+}
 
-# 스테이블코인 제외 블랙리스트
-STABLECOINS = {
+STABLECOINS: set[str] = {
     "KRW-USDT",
     "KRW-USDC",
     "KRW-DAI",
-    "KRW-TUSD",
     "KRW-BUSD",
-    "KRW-USDE",
     "KRW-FDUSD",
-    "KRW-EURC",
+    "KRW-PYUSD",
+    "KRW-TUSD",
 }
 
-# DB에 장기 보관할 1년 치 타임프레임 목표치
-TIMEFRAME_TARGETS = {
-    "1d": 365,
+TIMEFRAME_TARGETS: dict[str, int] = {
+    "1d": 730,
     "240m": 2190,
     "60m": 8760,
 }
 
-MINUTE_ENDPOINTS = {
-    "1m": "minutes/1",
-    "5m": "minutes/5",
-    "15m": "minutes/15",
-    "60m": "minutes/60",
-    "240m": "minutes/240",
-}
+MAX_CANDLES_PER_REQUEST = 200
+MAX_BACKFILL_PAGES_PER_COIN = 5
+REQUEST_SLEEP_SECONDS = 0.16
+MAX_429_RETRIES = 4
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS candles (
-            market TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
-            candle_time_kst TEXT NOT NULL,
-            open REAL NOT NULL,
-            high REAL NOT NULL,
-            low REAL NOT NULL,
-            close REAL NOT NULL,
-            volume REAL NOT NULL,
-            PRIMARY KEY (market, timeframe, candle_time_kst)
+def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
+def _ensure_candles_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(candles)").fetchall()
+    }
+    if "candle_acc_trade_price" not in cols:
+        conn.execute(
+            "ALTER TABLE candles ADD COLUMN candle_acc_trade_price REAL DEFAULT 0"
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_candles_lookup
-        ON candles (market, timeframe, candle_time_kst)
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS prediction_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            predicted_at TEXT NOT NULL,
-            market TEXT NOT NULL,
-            current_price REAL NOT NULL,
-            rec_buy_price REAL NOT NULL,
-            stop_loss REAL NOT NULL,
-            target_3 REAL NOT NULL,
-            target_5 REAL NOT NULL,
-            target_10 REAL NOT NULL,
-            target_20 REAL NOT NULL,
-            prob_3 REAL NOT NULL,
-            prob_5 REAL NOT NULL,
-            prob_10 REAL NOT NULL,
-            prob_20 REAL NOT NULL,
-            expected_buy_window TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            verified_at TEXT
+
+
+def init_db(conn: sqlite3.Connection | None = None, db_path: Path = DB_PATH) -> None:
+    owns_conn = conn is None
+    active_conn = conn if conn is not None else get_connection(db_path)
+    try:
+        active_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candles (
+                market TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                candle_time_kst TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL NOT NULL,
+                candle_acc_trade_price REAL DEFAULT 0,
+                PRIMARY KEY (market, timeframe, candle_time_kst)
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        _ensure_candles_columns(active_conn)
+        active_conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_candles_tf_market_time
+            ON candles (timeframe, market, candle_time_kst)
+            """
+        )
+        active_conn.commit()
+    finally:
+        if owns_conn:
+            active_conn.close()
 
 
-def _request_json(url: str, params: dict, max_retries: int = 4):
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 429:
-                time.sleep(0.6 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            if attempt == max_retries - 1:
-                return []
-            time.sleep(0.4 * (attempt + 1))
-    return []
+def load_state(state_path: Path = STATE_PATH) -> dict[str, Any]:
+    if not state_path.exists():
+        return {}
+    try:
+        with state_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
-def get_krw_markets() -> list:
-    data = _request_json(f"{UPBIT_BASE_URL}/market/all", {"isDetails": "false"})
-    if not data:
-        return []
-    markets = [
+def save_state(state: dict[str, Any], state_path: Path = STATE_PATH) -> None:
+    with state_path.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def _latest_candle_boundary(timeframe: str, dt: datetime) -> datetime:
+    """업비트 KST 기준 해당 시각이 속한 최신 캔들 시작 시각 반환"""
+    base = dt.replace(minute=0, second=0, microsecond=0)
+
+    if timeframe == "60m":
+        return base
+
+    if timeframe == "240m":
+        # 업비트 4시간봉 시작 시각: 01, 05, 09, 13, 17, 21시
+        if base.hour == 0:
+            return (base - timedelta(days=1)).replace(hour=21)
+        shifted = base - timedelta(hours=1)
+        slot_start_hour = (shifted.hour // 4) * 4 + 1
+        return shifted.replace(hour=slot_start_hour)
+
+    if timeframe == "1d":
+        # 업비트 일봉 시작 시각: 매일 09:00
+        today_9am = base.replace(hour=9)
+        if dt < today_9am:
+            return today_9am - timedelta(days=1)
+        return today_9am
+
+    return base
+
+
+def _should_skip_timeframe(
+    timeframe: str,
+    state: dict[str, Any],
+    now_dt: datetime,
+) -> tuple[bool, str]:
+    """마지막 수집 이후 업비트 기준 새 캔들 경계를 넘지 않았으면 스킵"""
+    entry = state.get(timeframe)
+    if not isinstance(entry, dict):
+        return False, ""
+
+    last_str = entry.get("last_collected_at")
+    if not last_str:
+        return False, ""
+
+    try:
+        last_dt = datetime.fromisoformat(last_str)
+    except Exception:
+        return False, ""
+
+    cur_boundary = _latest_candle_boundary(timeframe, now_dt)
+    last_boundary = _latest_candle_boundary(timeframe, last_dt)
+
+    if cur_boundary <= last_boundary:
+        return (
+            True,
+            f"현재 봉({cur_boundary.strftime('%Y-%m-%d %H:%M')}) 이미 수집됨 "
+            f"(마지막 수집: {last_str})",
+        )
+
+    return False, ""
+
+
+def get_krw_markets(
+    session: requests.Session | None = None,
+    exclude_stablecoins: bool = False,
+) -> list[str]:
+    client = session or requests.Session()
+    resp = client.get(UPBIT_MARKETS_URL, params={"isDetails": "false"}, timeout=10)
+    resp.raise_for_status()
+    markets = resp.json()
+    krw_markets = [
         item["market"]
-        for item in data
-        if item.get("market", "").startswith("KRW-") and item.get("market") not in STABLECOINS
+        for item in markets
+        if isinstance(item, dict) and str(item.get("market", "")).startswith("KRW-")
     ]
-    return sorted(markets)
+    if exclude_stablecoins:
+        krw_markets = [m for m in krw_markets if m not in STABLECOINS]
+    return krw_markets
+
+
+fetch_krw_markets = get_krw_markets
+
+
+def _normalize_candle_time(raw_kst: str) -> str:
+    # 업비트 응답 예: "2026-11-25T13:00:00"
+    return raw_kst[:19]
 
 
 def fetch_candles(
     market: str,
+    timeframe: str,
+    to_kst: str | None = None,
+    count: int = MAX_CANDLES_PER_REQUEST,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    url = UPBIT_CANDLE_URLS[timeframe]
+    params: dict[str, Any] = {
+        "market": market,
+        "count": min(count, MAX_CANDLES_PER_REQUEST),
+    }
+    if to_kst:
+        params["to"] = to_kst
+
+    client = session or requests.Session()
+    for attempt in range(MAX_429_RETRIES + 1):
+        resp = client.get(url, params=params, timeout=15)
+        if resp.status_code == 429 and attempt < MAX_429_RETRIES:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait_sec = float(retry_after) if retry_after else 0.5 * (attempt + 1)
+            except ValueError:
+                wait_sec = 0.5 * (attempt + 1)
+            time.sleep(max(wait_sec, 0.25))
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    return []
+
+
+fetch_candles_page = fetch_candles
+
+
+def fetch_realtime_candles(
+    market: str,
     timeframe: str = "60m",
-    count: int = 200,
-    to: Optional[str] = None,
-) -> list:
-    """
-    업비트 캔들 조회 (최신순 리스트 반환)
-    timeframe: '1d', '240m', '60m', '15m', '5m', '1m'
-    """
-    count = max(1, min(200, int(count)))
-    params = {"market": market, "count": count}
-    if to:
-        params["to"] = to
+    count: int = MAX_CANDLES_PER_REQUEST,
+    session: requests.Session | None = None,
+) -> pd.DataFrame:
+    """업비트 실시간/최신 캔들을 시간순 DataFrame으로 반환"""
+    raw_rows = fetch_candles(
+        market=market,
+        timeframe=timeframe,
+        to_kst=None,
+        count=count,
+        session=session,
+    )
+    if not raw_rows:
+        return pd.DataFrame(
+            columns=[
+                "candle_time_kst",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "candle_acc_trade_price",
+            ]
+        )
 
-    if timeframe == "1d":
-        url = f"{UPBIT_BASE_URL}/candles/days"
-    elif timeframe in MINUTE_ENDPOINTS:
-        url = f"{UPBIT_BASE_URL}/candles/{MINUTE_ENDPOINTS[timeframe]}"
-    else:
-        raise ValueError(f"지원하지 않는 timeframe: {timeframe}")
-
-    data = _request_json(url, params)
-    return data if isinstance(data, list) else []
-
-
-def fetch_realtime_candles(market: str, timeframe: str = "15m", count: int = 100) -> pd.DataFrame:
-    """
-    실시간 분석용 캔들 조회 후 시간순(오름차순) DataFrame 반환
-    timeframe: '1m', '5m', '15m', '60m', '240m', '1d'
-    """
-    raw = fetch_candles(market, timeframe=timeframe, count=min(200, count))
-    if not raw:
-        return pd.DataFrame(columns=["candle_time_kst", "open", "high", "low", "close", "volume"])
-
-    rows = [
+    records = [
         {
-            "candle_time_kst": c["candle_date_time_kst"],
-            "open": float(c["opening_price"]),
-            "high": float(c["high_price"]),
-            "low": float(c["low_price"]),
-            "close": float(c["trade_price"]),
-            "volume": float(c.get("candle_acc_trade_volume", c.get("candle_acc_volume", 0.0))),
+            "candle_time_kst": _normalize_candle_time(str(item["candle_date_time_kst"])),
+            "open": float(item["opening_price"]),
+            "high": float(item["high_price"]),
+            "low": float(item["low_price"]),
+            "close": float(item["trade_price"]),
+            "volume": float(item["candle_acc_trade_volume"]),
+            "candle_acc_trade_price": float(item.get("candle_acc_trade_price", 0.0)),
         }
-        for c in raw
+        for item in raw_rows
     ]
-    df = pd.DataFrame(rows).drop_duplicates(subset=["candle_time_kst"])
-    return df.sort_values("candle_time_kst").reset_index(drop=True)
+    df = pd.DataFrame(records)
+    df = (
+        df.sort_values("candle_time_kst")
+        .drop_duplicates("candle_time_kst", keep="last")
+        .reset_index(drop=True)
+    )
+    return df
 
 
-def get_existing_count(market: str, timeframe: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
+def upsert_candles(
+    conn: sqlite3.Connection,
+    market: str,
+    timeframe: str,
+    rows: list[dict[str, Any]],
+) -> int:
+    if not rows:
+        return 0
+
+    _ensure_candles_columns(conn)
+
+    records = []
+    for item in rows:
+        candle_time = _normalize_candle_time(str(item["candle_date_time_kst"]))
+        records.append(
+            (
+                market,
+                timeframe,
+                candle_time,
+                float(item["opening_price"]),
+                float(item["high_price"]),
+                float(item["low_price"]),
+                float(item["trade_price"]),
+                float(item["candle_acc_trade_volume"]),
+                float(item.get("candle_acc_trade_price", 0.0)),
+            )
+        )
+
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO candles (
+            market, timeframe, candle_time_kst,
+            open, high, low, close, volume, candle_acc_trade_price
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        records,
+    )
+    conn.commit()
+    return len(records)
+
+
+def get_market_candle_count(conn: sqlite3.Connection, market: str, timeframe: str) -> int:
+    cur = conn.execute(
         "SELECT COUNT(*) FROM candles WHERE market = ? AND timeframe = ?",
         (market, timeframe),
     )
-    cnt = cur.fetchone()[0]
-    conn.close()
-    return int(cnt)
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
 
 
-def collect_timeframe_for_all(timeframe: str, target_count: int):
-    markets = get_krw_markets()
-    total = len(markets)
-    start_ts = time.time()
+def get_oldest_candle_time(
+    conn: sqlite3.Connection,
+    market: str,
+    timeframe: str,
+) -> str | None:
+    cur = conn.execute(
+        "SELECT MIN(candle_time_kst) FROM candles WHERE market = ? AND timeframe = ?",
+        (market, timeframe),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row and row[0] else None
 
-    print(f"\n=== [{timeframe}] 수집 시작 (목표: 코인당 {target_count}개) ===")
 
-    for idx, market in enumerate(markets, start=1):
-        existing = get_existing_count(market, timeframe)
-        if existing >= target_count:
-            print(f"[{timeframe} {idx}/{total}] {market} | 이미 {existing}개 보유 (스킵)")
-            continue
+def collect_market_timeframe(
+    conn: sqlite3.Connection,
+    market: str,
+    timeframe: str,
+    target_count: int,
+    session: requests.Session,
+) -> int:
+    total_saved = 0
 
-        to_dt = None
-        fetched_total = 0
-        seen_times = set()
+    # 1. 최신 캔들 수집
+    latest_rows = fetch_candles(
+        market=market,
+        timeframe=timeframe,
+        to_kst=None,
+        count=MAX_CANDLES_PER_REQUEST,
+        session=session,
+    )
+    total_saved += upsert_candles(conn, market, timeframe, latest_rows)
+    time.sleep(REQUEST_SLEEP_SECONDS)
 
-        while existing + fetched_total < target_count:
-            candles = fetch_candles(market, timeframe=timeframe, count=200, to=to_dt)
-            if not candles:
-                break
+    # 2. 목표 개수 미만이면 과거 구간 백필(최대 MAX_BACKFILL_PAGES_PER_COIN 페이지)
+    pages_fetched = 0
+    while (
+        get_market_candle_count(conn, market, timeframe) < target_count
+        and pages_fetched < MAX_BACKFILL_PAGES_PER_COIN
+    ):
+        oldest_time = get_oldest_candle_time(conn, market, timeframe)
+        if not oldest_time:
+            break
 
-            new_rows = []
-            oldest_in_batch = None
-            for c in candles:
-                t_kst = c["candle_date_time_kst"]
-                if t_kst in seen_times:
-                    continue
-                seen_times.add(t_kst)
-                oldest_in_batch = t_kst
-                new_rows.append((
-                    market,
-                    timeframe,
-                    t_kst,
-                    float(c["opening_price"]),
-                    float(c["high_price"]),
-                    float(c["low_price"]),
-                    float(c["trade_price"]),
-                    float(c.get("candle_acc_trade_volume", c.get("candle_acc_volume", 0.0))),
-                ))
-
-            if not new_rows:
-                break
-
-            conn = sqlite3.connect(DB_PATH)
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO candles (
-                    market, timeframe, candle_time_kst, open, high, low, close, volume
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                new_rows,
-            )
-            conn.commit()
-            conn.close()
-
-            fetched_total += len(new_rows)
-            if len(candles) < 200 or not oldest_in_batch:
-                break
-            to_dt = oldest_in_batch
-            time.sleep(0.12)
-
-        now_cnt = get_existing_count(market, timeframe)
-        elapsed = time.time() - start_ts
-        rem_sec = int((elapsed / idx) * (total - idx))
-        rem_str = f"{rem_sec // 60}분 {rem_sec % 60}초"
-        tag = " (상장 이후 전량)" if now_cnt < target_count else ""
-        print(
-            f"[{timeframe} {idx}/{total}] {market} | 보유: {now_cnt}개 | "
-            f"최과거: {to_dt or '최신'}{tag} | 남은시간 약 {rem_str}"
+        older_rows = fetch_candles(
+            market=market,
+            timeframe=timeframe,
+            to_kst=oldest_time,
+            count=MAX_CANDLES_PER_REQUEST,
+            session=session,
         )
+        if not older_rows:
+            break
+
+        total_saved += upsert_candles(conn, market, timeframe, older_rows)
+        pages_fetched += 1
+        time.sleep(REQUEST_SLEEP_SECONDS)
+
+    return total_saved
 
 
-def run_collection_pipeline():
-    init_db()
-    collect_timeframe_for_all("1d", TIMEFRAME_TARGETS["1d"])
-    collect_timeframe_for_all("240m", TIMEFRAME_TARGETS["240m"])
-    collect_timeframe_for_all("60m", TIMEFRAME_TARGETS["60m"])
-    print("\n[완료] 1d / 240m / 60m 수집 파이프라인 종료")
+def collect_timeframe_for_all(
+    timeframe: str,
+    target_count: int | None = None,
+    force: bool = False,
+    db_path: Path = DB_PATH,
+    state_path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    if timeframe not in UPBIT_CANDLE_URLS:
+        raise ValueError(f"지원하지 않는 타임프레임입니다: {timeframe}")
+
+    resolved_target = target_count or TIMEFRAME_TARGETS.get(timeframe, 1000)
+    now_dt = datetime.now()
+    state = load_state(state_path)
+
+    if not force:
+        should_skip, reason = _should_skip_timeframe(timeframe, state, now_dt)
+        if should_skip:
+            print(f"[{timeframe}] 스킵: {reason}")
+            return {"timeframe": timeframe, "skipped": True, "reason": reason}
+
+    conn = get_connection(db_path)
+    init_db(conn)
+
+    session = requests.Session()
+    try:
+        markets = get_krw_markets(session, exclude_stablecoins=True)
+        print(f"[{timeframe}] 대상 코인 {len(markets)}개 수집 시작 (목표 {resolved_target}개)")
+
+        total_rows = 0
+        for idx, market in enumerate(markets, start=1):
+            before_cnt = get_market_candle_count(conn, market, timeframe)
+            try:
+                collect_market_timeframe(
+                    conn=conn,
+                    market=market,
+                    timeframe=timeframe,
+                    target_count=resolved_target,
+                    session=session,
+                )
+            except Exception as exc:
+                print(f"[{timeframe}] {market} 수집 오류: {exc}")
+                continue
+
+            after_cnt = get_market_candle_count(conn, market, timeframe)
+            diff = after_cnt - before_cnt
+            total_rows += max(diff, 0)
+
+            if idx % 50 == 0 or idx == len(markets):
+                print(f"[{timeframe}] 진행 {idx}/{len(markets)} ({market}: +{diff}개, 누적 {after_cnt}개)")
+
+        finished_at = datetime.now().isoformat(timespec="seconds")
+        state[timeframe] = {
+            "last_collected_at": finished_at,
+            "market_count": len(markets),
+            "target_count": resolved_target,
+        }
+        save_state(state, state_path)
+
+        print(f"[{timeframe}] 완료: 총 +{total_rows}개 반영 ({finished_at})")
+        return {
+            "timeframe": timeframe,
+            "skipped": False,
+            "market_count": len(markets),
+            "added_rows": total_rows,
+            "finished_at": finished_at,
+        }
+    finally:
+        session.close()
+        conn.close()
+
+
+def run_collection_pipeline(
+    timeframes: tuple[str, ...] = ("1d", "240m", "60m"),
+    force: bool = False,
+    db_path: Path = DB_PATH,
+    state_path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    for tf in timeframes:
+        results[tf] = collect_timeframe_for_all(
+            timeframe=tf,
+            target_count=TIMEFRAME_TARGETS.get(tf),
+            force=force,
+            db_path=db_path,
+            state_path=state_path,
+        )
+    return results
 
 
 if __name__ == "__main__":
