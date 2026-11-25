@@ -15,6 +15,9 @@ STATE_PATH = BASE_DIR / "collect_state.json"
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_MARKETS_URL = f"{UPBIT_BASE_URL}/v1/market/all"
 UPBIT_CANDLE_URLS = {
+    "1m": f"{UPBIT_BASE_URL}/v1/candles/minutes/1",
+    "5m": f"{UPBIT_BASE_URL}/v1/candles/minutes/5",
+    "15m": f"{UPBIT_BASE_URL}/v1/candles/minutes/15",
     "60m": f"{UPBIT_BASE_URL}/v1/candles/minutes/60",
     "240m": f"{UPBIT_BASE_URL}/v1/candles/minutes/240",
     "1d": f"{UPBIT_BASE_URL}/v1/candles/days",
@@ -199,7 +202,9 @@ def fetch_candles(
     count: int = MAX_CANDLES_PER_REQUEST,
     session: requests.Session | None = None,
 ) -> list[dict[str, Any]]:
-    url = UPBIT_CANDLE_URLS[timeframe]
+    url = UPBIT_CANDLE_URLS.get(timeframe)
+    if not url:
+        return []
     params: dict[str, Any] = {
         "market": market,
         "count": min(count, MAX_CANDLES_PER_REQUEST),
